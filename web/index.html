@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="本地保存的论文进度、投稿历史与转投计划。">
+  <title>论文管理台 · PaperDesk</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/interaction.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#papers" aria-label="论文管理台首页"><span class="brand-icon">P</span><span>论文管理台<small>PAPERDESK</small></span></a>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="主导航">
+      <button class="nav-item active" data-view="papers"><span class="nav-icon">▤</span>论文总览</button>
+      <button class="nav-item" data-view="journals"><span class="nav-icon">▥</span>期刊管理</button>
+      <button class="nav-item" data-view="backup"><span class="nav-icon">◫</span>数据与备份</button>
+    </nav>
+    <div class="sidebar-bottom"><div class="local-status"><span class="status-dot"></span>本机保存</div><p>每一轮投稿，都有记录。</p><button id="quit" class="quit-button">退出平台</button></div>
+  </aside>
+  <main class="workspace">
+    <div class="topbar"><span>我的论文工作空间</span><span id="today" class="date-label"></span></div>
+    <div id="content" aria-live="polite"><div class="loading">正在读取本机记录…</div></div>
+    <footer>PaperDesk · 记录保存在本机，稿件保留在原文件夹</footer>
+  </main>
+  <div id="drawer-layer" class="drawer-layer" hidden>
+    <div class="scrim" data-action="close-drawer"></div>
+    <section id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1"></section>
+  </div>
+  <div id="modal-layer" class="modal-layer" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="eyebrow">操作确认</div><h2 id="modal-title"></h2><p id="modal-body"></p>
+      <div class="modal-actions"><button id="modal-cancel" class="button secondary">取消</button><button id="modal-ok" class="button primary">确认</button></div>
+    </section>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <input id="import-file" type="file" accept="application/json,.json" hidden>
+</body>
+</html>
