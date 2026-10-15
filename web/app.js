@@ -43,7 +43,8 @@ function toast(message,error=false) {
 async function refresh(render=true) {
   state = await api('/api/state');
   disconnected = false;
-  $('today').textContent = state.today.replace(/-/g,'.');
+  const [year,month,day] = state.today.split('-');
+  $('today').textContent = `${year}年${Number(month)}月${Number(day)}日`;
   document.querySelector('footer').textContent = `PaperDesk v${state.app_version || '1.0.0'} · 记录保存在本机，稿件保留在原文件夹`;
   if (render) renderView();
 }
@@ -63,7 +64,7 @@ function renderView() {
 
 function renderPapers() {
   $('content').innerHTML = header('论文总览','记录进度、投稿与每一轮等待。',`<button class="button primary" data-action="new-paper"><span aria-hidden="true">＋</span>新建论文</button>`) +
-  `<div class="stats">${Object.entries(stages).map(([key,label])=>`<button class="stat ${key} ${filters.stage===key?'selected':''}" data-action="filter-stage" data-stage="${key}" aria-label="查看${label}论文"><span class="stat-name"><span class="stat-marker"></span>${label}</span><strong>${state.counts[key]}<small>篇</small></strong></button>`).join('')}</div>` +
+  `<div class="stats">${Object.entries(stages).map(([key,label])=>`<button class="stat ${key} ${filters.stage===key?'selected':''}" data-action="filter-stage" data-stage="${key}" aria-label="查看${label}论文" aria-pressed="${filters.stage===key}"><span class="stat-name"><span class="stat-marker">${icon(key,'stat-icon')}</span>${label}</span><strong>${state.counts[key]}<small>篇</small></strong></button>`).join('')}</div>` +
   (state.overdue_count?`<div class="overdue-strip"><span aria-hidden="true">◷</span><span>${state.overdue_count} 篇论文超过计划转投时间，可以继续等待或调整计划。</span><button class="link-button" data-action="show-overdue">查看记录 →</button></div>`:'') +
   `<section class="panel"><div class="panel-title"><h2>我的论文</h2><span id="paper-total"></span></div>
   <div class="toolbar"><div class="searchbox">${icon('search','search-icon')}<input id="search" type="search" placeholder="搜索论文标题、作者或标签" value="${esc(filters.search)}" aria-label="搜索论文"></div>
@@ -80,7 +81,7 @@ function renderPapers() {
   renderPaperTable();
 }
 
-function syncStats() {document.querySelectorAll('.stat').forEach(b=>b.classList.toggle('selected',b.dataset.stage===filters.stage));}
+function syncStats() {document.querySelectorAll('.stat').forEach(b=>{const selected=b.dataset.stage===filters.stage;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',String(selected));});}
 function earlyStage(p) {return p.stage==='planned'||p.stage==='writing';}
 function listedJournal(p) {
   if(earlyStage(p))return p.target_journal;
