@@ -44,6 +44,47 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.paper_detail(self.paper)["title"], "测试论文")
         self.assertEqual(self.current()["candidates"][0]["id"], self.next_journal)
 
+    def test_directly_add_submitted_and_revision_papers(self):
+        for stage in ("submitted", "revision"):
+            ident = self.store.paper_save({"title": "之前已投稿", "stage": stage,
+                "target_journal_id": self.next_journal,
+                "initial_submission": self.submission(submitted_on="2026-09-01", manuscript_number="OLD-001", progress="外审中", transfer_mode="days", wait_days=60)})
+            detail = self.store.paper_detail(ident)
+            self.assertEqual(detail["stage"], stage)
+            self.assertEqual(len(detail["submissions"]), 1)
+            self.assertEqual(detail["submissions"][0]["elapsed_days"], 43)
+            self.assertEqual(detail["submissions"][0]["manuscript_number"], "OLD-001")
+            self.assertEqual(detail["submissions"][0]["target_on"], "2026-10-31")
+            self.assertEqual(detail["target_journal_id"], self.next_journal)
+            self.assertIsNone(detail["writing_started_on"])
+        exported = self.store.export()
+        self.store.close()
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.export()["data"], exported["data"])
+
+    def test_invalid_initial_submission_leaves_no_partial_paper(self):
+        before = self.store.export()["data"]
+        cases = [None, [], self.submission(journal_id=999), self.submission(submitted_on="2026-02-30"),
+                 self.submission(submitted_on="2026-10-15"), self.submission(candidate_ids=[999]),
+                 self.submission(ended_on="2026-10-14", result="rejected")]
+        for initial in cases:
+            with self.subTest(initial=initial), self.assertRaises(ValidationError):
+                self.store.paper_save({"title": "不能只存下论文", "stage": "submitted", "initial_submission": initial})
+            self.assertEqual(self.store.export()["data"], before)
+        with self.assertRaises(ValidationError):
+            self.store.paper_save({"title": "不能覆盖", "stage": "writing", "initial_submission": self.submission()}, self.paper)
+        self.assertEqual(self.store.export()["data"], before)
+
+    def test_initial_round_write_failure_rolls_back_paper_files_and_round(self):
+        before = self.store.export()["data"]
+        self.store.conn.execute("CREATE TEMP TRIGGER fail_candidate BEFORE INSERT ON candidates BEGIN SELECT RAISE(ABORT, 'simulated full disk'); END")
+        try:
+            with self.assertRaises(ValidationError):
+                self.store.paper_save({"title": "一起回滚", "stage": "submitted", "files": [{"path": str(Path(self.temp.name) / "稿件.pdf")}], "initial_submission": self.submission()})
+        finally:
+            self.store.conn.execute("DROP TRIGGER fail_candidate")
+        self.assertEqual(self.store.export()["data"], before)
+
     def test_due_today_not_overdue_next_day_is(self):
         data = self.submission(submitted_on="2026-09-14", transfer_mode="days", wait_days=30)
         ident = self.store.submission_save(self.paper, data)
@@ -336,6 +377,19 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.request("/api/state", headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
         self.assertEqual(self.request("/../paperdesk.py")[0], 404)
         self.assertEqual(self.store.state()["papers"], [])
+
+    def test_add_existing_submission_in_one_request(self):
+        journal = self.store.journal_save({"name": "接口期刊"})
+        headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url}
+        code, body, _ = self.request("/api/papers", "POST", {"title": "已投文章", "stage": "submitted", "initial_submission": {"journal_id": journal, "submitted_on": "2024-12-31"}}, headers)
+        self.assertEqual(code, 200)
+        ident = json.loads(body)["id"]
+        detail = self.store.paper_detail(ident)
+        self.assertEqual(detail["stage"], "submitted")
+        self.assertEqual(detail["submissions"][0]["submitted_on"], "2024-12-31")
+        code, _, _ = self.request("/api/papers", "POST", {"title": "无效日期", "stage": "submitted", "initial_submission": {"journal_id": journal, "submitted_on": "2024-02-30"}}, headers)
+        self.assertEqual(code, 400)
+        self.assertEqual(len(self.store.state()["papers"]), 1)
 
     def test_port_is_exclusive(self):
         with self.assertRaises(OSError):

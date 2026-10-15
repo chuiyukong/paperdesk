@@ -192,14 +192,15 @@ function fileEditRow(f={}) {return `<div class="file-edit-row" data-file-row><di
 async function paperForm(id) {
   const p=id?await api(`/api/papers/${id}`):{title:'',authors:'',tags:'',stage:'writing',notes:'',folder:'',planned_on:null,writing_started_on:state.today,target_journal_id:null,files:[],submissions:[]};
   const active=p.submissions.some(r=>!r.ended_on);
-  const allowed=active?['submitted','revision','archived']:['planned','writing','accepted','archived'];
+  const allowed=!id?Object.keys(stages):active?['submitted','revision','archived']:['planned','writing','accepted','archived'];
   showDrawer(drawerHeader(id?'编辑论文':'新建论文',id?'论文信息':'从一篇论文开始')+`<div class="drawer-body"><form id="paper-form"><div id="form-error" class="form-error" hidden></div>
     <div class="form-field"><label for="p-title">论文标题 <span class="required">*</span></label><input id="p-title" required maxlength="500" placeholder="填写论文标题" value="${esc(p.title)}"></div>
     <div class="form-grid"><div class="form-field"><label for="p-authors">作者</label><input id="p-authors" maxlength="1000" placeholder="作者姓名" value="${esc(p.authors)}"></div><div class="form-field"><label for="p-stage">论文阶段</label><select id="p-stage">${Object.entries(stages).map(([k,v])=>`<option value="${k}" ${p.stage===k?'selected':''} ${!allowed.includes(k)?'disabled':''}>${v}</option>`).join('')}</select></div></div>
-    <p class="field-help">${active?'当前有进行中的投稿。录用或退稿时，请在投稿历史中“结束本轮”。':'登记投稿后，阶段会自动变为“已投稿”。'}</p>
-    <div class="form-field"><label for="p-target-journal">初始目标期刊</label><select id="p-target-journal" class="journal-select">${journalOptions(p.target_journal_id,'暂不设置')}</select><small>最初计划投稿的期刊，独立于每轮投稿和转投候选，可随时修改。</small></div>
+    <p id="p-stage-help" class="field-help">${active?'当前有进行中的投稿。录用或退稿时，请在投稿历史中“结束本轮”。':id?'登记投稿后，阶段会自动变为“已投稿”。':'之前已经投稿的论文，可以直接选择“已投稿”或“退修中”，填写原投稿信息。'}</p>
+    ${!id?`<section id="p-initial-submission" class="initial-submission" hidden><div class="section-heading">当前投稿</div><div class="form-field"><label for="p-submission-journal">投稿期刊 <span class="required">*</span></label><select id="p-submission-journal" class="journal-select">${journalOptions()}</select><small>没有找到期刊？可在下方快速新增。</small></div><div class="form-grid"><div class="form-field"><label for="p-submitted-on">原投稿日期 <span class="required">*</span></label><input id="p-submitted-on" type="date" max="${state.today}" value="${state.today}"></div><div class="form-field"><label for="p-manuscript-number">稿件编号</label><input id="p-manuscript-number" maxlength="200" placeholder="选填"></div></div><div class="form-field"><label for="p-submission-progress">当前进展</label><input id="p-submission-progress" maxlength="1000" placeholder="例如：外审中、已收到修改意见"></div><p class="field-help">按原投稿日期计算等待天数。保存后可在投稿历史中设置转投计划、补录更早的轮次。</p></section>`:''}
+    <div id="p-target-field" class="form-field"><label for="p-target-journal">初始目标期刊</label><select id="p-target-journal" class="journal-select">${journalOptions(p.target_journal_id,'暂不设置')}</select><small>最初计划投稿的期刊，独立于每轮投稿和转投候选，可随时修改。</small></div>
     ${quickJournalForm('p-target-journal')}
-    <div class="form-grid"><div class="form-field"><label for="p-planned-on">计划建立日期</label><input id="p-planned-on" type="date" max="${state.today}" value="${esc(p.planned_on||'')}"></div><div class="form-field"><label for="p-writing-on">开始撰写日期</label><input id="p-writing-on" type="date" max="${state.today}" value="${esc(p.writing_started_on||'')}"></div></div><p class="field-help">从对应日期开始计时，当天为第 0 天；可以补填或留空。</p>
+    <div id="p-stage-dates"><div class="form-grid"><div class="form-field"><label for="p-planned-on">计划建立日期</label><input id="p-planned-on" type="date" max="${state.today}" value="${esc(p.planned_on||'')}"></div><div class="form-field"><label for="p-writing-on">开始撰写日期</label><input id="p-writing-on" type="date" max="${state.today}" value="${esc(p.writing_started_on||'')}"></div></div><p class="field-help">从对应日期开始计时，当天为第 0 天；可以补填或留空。</p></div>
     <div class="form-field"><label for="p-tags">标签</label><input id="p-tags" maxlength="1000" placeholder="例如：人工智能、跨学科、教学设计" value="${esc(p.tags)}"></div>
     <div class="form-field"><label for="p-notes">备注</label><textarea id="p-notes" maxlength="10000" placeholder="写作思路、修改安排或刊出信息…">${esc(p.notes)}</textarea></div>
     <div class="section-heading">本地文件关联</div><div class="form-field"><label for="p-folder">论文文件夹</label><div class="inline-input"><input id="p-folder" maxlength="4000" placeholder="粘贴完整路径，或选择文件夹" value="${esc(p.folder)}"><button class="button secondary small" type="button" data-action="pick-folder">选择</button></div></div>
@@ -207,11 +208,24 @@ async function paperForm(id) {
     ${id?`<div class="section-heading">记录管理</div><p class="field-help">暂时不需要的论文可以设为归档，所有历史继续保留。</p><button class="button danger small" type="button" data-action="delete-paper" data-id="${id}">删除论文及投稿记录</button>`:''}
     </form></div>`+formActions('paper-form'),{kind:'paper-form',paperId:id||null});
   $('paper-form').addEventListener('submit',savePaper);
+  let automaticWritingDate=!id;
+  $('p-writing-on').addEventListener('input',()=>{automaticWritingDate=false;});
+  const syncInitialSubmission=()=>{
+    if(id)return;
+    const direct=['submitted','revision'].includes($('p-stage').value);
+    $('p-initial-submission').hidden=!direct;
+    $('p-target-field').hidden=direct;$('p-stage-dates').hidden=direct;
+    for(const key of ['p-submission-journal','p-submitted-on']){$(key).required=direct;$(key).disabled=!direct;}
+    document.querySelector('[data-action="quick-journal"]').dataset.target=direct?'p-submission-journal':'p-target-journal';
+    if(direct&&!$('p-submission-journal').value)$('p-submission-journal').value=$('p-target-journal').value;
+    if($('p-stage').value!=='writing'&&automaticWritingDate)$('p-writing-on').value='';
+  };
   $('p-stage').addEventListener('change',()=>{
     if($('p-stage').value==='planned'&&!$('p-planned-on').value)$('p-planned-on').value=state.today;
     if($('p-stage').value==='writing'&&!$('p-writing-on').value)$('p-writing-on').value=state.today;
-    if(!id&&$('p-stage').value==='planned'&&$('p-writing-on').value===state.today)$('p-writing-on').value='';
+    syncInitialSubmission();
   });
+  syncInitialSubmission();
 }
 
 async function savePaper(event) {
@@ -224,6 +238,7 @@ async function savePaper(event) {
       target_journal_id:$('p-target-journal').value?Number($('p-target-journal').value):null,planned_on:$('p-planned-on').value||null,writing_started_on:$('p-writing-on').value||null,
       files:[...document.querySelectorAll('[data-file-row]')].map(row=>({label:row.querySelector('.file-label').value,path:row.querySelector('.file-path').value}))};
     const id=drawerInfo.paperId;
+    if(!id&&['submitted','revision'].includes(data.stage))data.initial_submission={journal_id:Number($('p-submission-journal').value),submitted_on:$('p-submitted-on').value,manuscript_number:$('p-manuscript-number').value,progress:$('p-submission-progress').value,transfer_mode:'none',candidate_ids:[]};
     const saved=await api(id?`/api/papers/${id}`:'/api/papers',id?'PUT':'POST',data);
     drawerDirty=false;
     await refresh();

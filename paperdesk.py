@@ -285,6 +285,12 @@ class Store:
                   "folder": checked_path(text_field(data, "folder", limit=4000), True)}
         if fields["stage"] not in STAGES:
             raise ValidationError("请选择有效的论文阶段。")
+        initial = data.get("initial_submission")
+        if initial is not None:
+            if record_id or fields["stage"] not in ("submitted", "revision") or not isinstance(initial, dict):
+                raise ValidationError("首轮投稿只能随新建的已投稿或退修中论文一起登记。")
+            if initial.get("ended_on") or initial.get("result"):
+                raise ValidationError("直接添加已投稿论文时，首轮投稿应为进行中。")
         for key, label in (("planned_on", "计划建立日期"), ("writing_started_on", "开始撰写日期")):
             if key in data:
                 value = data[key]
@@ -316,8 +322,8 @@ class Store:
             if record_id:
                 previous = self.require("papers", record_id)
                 active = self.conn.execute("SELECT id FROM submissions WHERE paper_id=? AND ended_on IS NULL", (record_id,)).fetchone()
-            if fields["stage"] in ("submitted", "revision") and not active:
-                raise ValidationError("请先在论文详情中登记投稿，再设置为已投稿或退修中。")
+            if fields["stage"] in ("submitted", "revision") and not active and initial is None:
+                raise ValidationError("新建已投稿论文时请填写投稿期刊与日期；已有论文请在详情中登记投稿。")
             if active and fields["stage"] not in ("submitted", "revision", "archived"):
                 raise ValidationError("请先结束当前投稿；录用时选择结果“录用”，平台会自动更新阶段。")
             for key, phase in (("planned_on", "planned"), ("writing_started_on", "writing")):
@@ -344,6 +350,10 @@ class Store:
             self.conn.execute("DELETE FROM files WHERE paper_id=?", (record_id,))
             self.conn.executemany("INSERT INTO files(paper_id,label,path) VALUES(?,?,?)",
                                   [(record_id, label, path) for label, path in normalized])
+            if initial is not None:
+                # Both records share this transaction; a failed round leaves no partial paper.
+                self._submission_action(record_id, initial)()
+                self.conn.execute("UPDATE papers SET stage=? WHERE id=?", (fields["stage"], record_id))
             return record_id
         return self.mutate(action)
 
@@ -354,6 +364,9 @@ class Store:
         self.mutate(action, "delete")
 
     def submission_save(self, paper_id, data, record_id=None):
+        return self.mutate(self._submission_action(paper_id, data, record_id))
+
+    def _submission_action(self, paper_id, data, record_id=None):
         fields = submission_fields(data, self.day_provider())
         candidates = data.get("candidate_ids", [])
         if not isinstance(candidates, list) or len(candidates) > 100:
@@ -401,7 +414,7 @@ class Store:
                     phase = "accepted" if fields["result"] == "accepted" else "writing"
             self.conn.execute("UPDATE papers SET stage=?,updated_at=? WHERE id=?", (phase, stamp, paper_id))
             return record_id
-        return self.mutate(action)
+        return action
 
     def submission_delete(self, record_id):
         def action():
