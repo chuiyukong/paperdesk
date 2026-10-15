@@ -176,6 +176,7 @@ class StoreTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.store.paper_delete(self.paper)
         self.assertEqual(self.store.export()["data"], before["data"])
+
         original = Store.insert_export
         calls = 0
         def failed_live_write(connection, data):
@@ -188,6 +189,82 @@ class StoreTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 self.store.restore(before)
         self.assertEqual(self.store.export()["data"], before["data"])
+
+    def test_original_v1_backup_still_restores_without_app_version(self):
+        payload = json.loads((Path(__file__).parent / "testdata" / "v1-backup.json").read_text(encoding="utf-8"))
+        original = copy.deepcopy(payload)
+        self.store.restore(payload)
+        restored = self.store.export()["data"]
+        expected = copy.deepcopy(payload["data"])
+        for paper in expected["papers"]:
+            paper.update(planned_on=None, writing_started_on=None, target_journal_id=None)
+        self.assertEqual(restored, expected)
+        self.assertEqual(payload, original)
+
+    def test_original_database_upgrade_and_old_snapshot_restore(self):
+        fixture = Path(__file__).parent / "testdata"
+        data = json.loads((fixture / "v1-backup.json").read_text(encoding="utf-8"))["data"]
+        self.store.close()
+        Path(self.temp.name, "paperdesk.sqlite3").unlink()
+        with closing(sqlite3.connect(Path(self.temp.name, "paperdesk.sqlite3"))) as old:
+            old.executescript((fixture / "v1-schema.sql").read_text(encoding="utf-8"))
+            Store.insert_export(old, data)
+            old.commit()
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        for paper in self.store.export()["data"]["papers"]:
+            paper.pop("planned_on")
+            paper.pop("writing_started_on")
+            paper.pop("target_journal_id")
+            self.assertIn(paper, data["papers"])
+        snapshot = next(b["name"] for b in self.store.backups() if b["name"].startswith("upgrade-"))
+        with closing(sqlite3.connect(self.store.backup_dir / snapshot)) as saved:
+            self.assertEqual(saved.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.store.paper_delete(data["papers"][0]["id"])
+        self.store.restore_snapshot(snapshot)
+        restored = self.store.paper_detail(data["papers"][0]["id"])
+        self.assertIsNone(restored["planned_on"])
+        self.assertIsNone(restored["target_journal_id"])
+        self.assertEqual(restored["submissions"][0]["candidates"][0]["name"], "原版候选期刊")
+
+    def test_initial_target_survives_submission_transfer_and_restore(self):
+        paper = self.store.paper_save({"title": "目标独立", "stage": "planned", "target_journal_id": self.journal})
+        self.assertEqual(self.store.state()["papers"][0]["target_journal"]["id"], self.journal)
+        with self.assertRaisesRegex(ValidationError, "初始目标"):
+            self.store.journal_delete(self.journal)
+        first = self.submission(journal_id=self.next_journal, candidate_ids=[self.journal])
+        ident = self.store.submission_save(paper, first)
+        self.assertEqual(self.store.paper_detail(paper)["target_journal_id"], self.journal)
+        self.store.submission_save(paper, {**first, "ended_on": self.day.isoformat(), "result": "rejected"}, ident)
+        self.store.submission_save(paper, self.submission(candidate_ids=[self.next_journal]))
+        payload = self.store.export()
+        self.store.restore(payload)
+        self.assertEqual(self.store.paper_detail(paper)["target_journal_id"], self.journal)
+        invalid = copy.deepcopy(payload)
+        invalid["data"]["papers"][0]["target_journal_id"] = 999
+        with self.assertRaises(ValidationError):
+            self.store.restore(invalid)
+        self.assertEqual(self.store.export()["data"], payload["data"])
+
+    def test_planning_and_writing_clocks_and_optional_old_dates(self):
+        self.day = dt.date(2024, 2, 28)
+        paper = self.store.paper_save({"title": "阶段计时", "stage": "planned"})
+        self.assertEqual(self.store.paper_detail(paper)["stage_elapsed_days"], 0)
+        self.day = dt.date(2024, 3, 1)
+        self.assertEqual(self.store.paper_detail(paper)["stage_elapsed_days"], 2)
+        self.store.paper_save({"title": "阶段计时", "stage": "writing"}, paper)
+        detail = self.store.paper_detail(paper)
+        self.assertEqual(detail["planned_on"], "2024-02-28")
+        self.assertEqual(detail["writing_started_on"], "2024-03-01")
+        self.assertEqual(detail["stage_elapsed_days"], 0)
+        self.day = dt.date(2025, 1, 1)
+        self.store.paper_save({"title": "阶段计时", "stage": "writing", "writing_started_on": "2024-12-31"}, paper)
+        self.assertEqual(self.store.paper_detail(paper)["stage_elapsed_days"], 1)
+        self.store.paper_save({"title": "阶段计时", "stage": "writing", "writing_started_on": None}, paper)
+        self.assertIsNone(self.store.paper_detail(paper)["stage_elapsed_days"])
+        for fields in ({"planned_on": "2025-01-02"}, {"writing_started_on": "2024-02-30"}, {"writing_started_on": "2024-02-27"}, {"target_journal_id": 999}):
+            with self.subTest(fields=fields), self.assertRaises(ValidationError):
+                self.store.paper_save({"title": "阶段计时", "stage": "writing", **fields}, paper)
 
     def test_registered_file_open_and_missing_file(self):
         with self.assertRaises(ValidationError):

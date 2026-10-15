@@ -1,0 +1,19 @@
+name: PaperDesk tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Verify manuscript workflows and backup compatibility
+        run: python -B -m unittest -v test_paperdesk
+      - name: Verify browser script syntax
+        run: node --check web/app.js

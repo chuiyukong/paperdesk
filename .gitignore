@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+*.sqlite3
+*.sqlite3-journal
+*.db
+*.log
+instance.json
+backups/
+dist/
+.env
+.env.*
+论文管理台-完整备份-*.json

@@ -15,16 +15,16 @@
     <a class="brand" href="#papers" aria-label="论文管理台首页"><span class="brand-icon">P</span><span>论文管理台<small>PAPERDESK</small></span></a>
     <div class="nav-label">工作空间</div>
     <nav aria-label="主导航">
-      <button class="nav-item active" data-view="papers"><span class="nav-icon">▤</span>论文总览</button>
-      <button class="nav-item" data-view="journals"><span class="nav-icon">▥</span>期刊管理</button>
-      <button class="nav-item" data-view="backup"><span class="nav-icon">◫</span>数据与备份</button>
+      <button class="nav-item active" data-view="papers"><svg class="nav-icon" aria-hidden="true"><use href="/icons.svg#papers"></use></svg>论文总览</button>
+      <button class="nav-item" data-view="journals"><svg class="nav-icon" aria-hidden="true"><use href="/icons.svg#journals"></use></svg>期刊管理</button>
+      <button class="nav-item" data-view="backup"><svg class="nav-icon" aria-hidden="true"><use href="/icons.svg#backup"></use></svg>数据与备份</button>
     </nav>
-    <div class="sidebar-bottom"><div class="local-status"><span class="status-dot"></span>本机保存</div><p>每一轮投稿，都有记录。</p><button id="quit" class="quit-button">退出平台</button></div>
+    <div class="sidebar-bottom"><div class="local-status"><span class="status-dot"></span>本机保存</div><p>每一轮投稿，都有记录。</p><button id="quit" class="quit-button"><svg class="quit-icon" aria-hidden="true"><use href="/icons.svg#power"></use></svg>退出平台</button></div>
   </aside>
   <main class="workspace">
     <div class="topbar"><span>我的论文工作空间</span><span id="today" class="date-label"></span></div>
     <div id="content" aria-live="polite"><div class="loading">正在读取本机记录…</div></div>
-    <footer>PaperDesk · 记录保存在本机，稿件保留在原文件夹</footer>
+    <footer>PaperDesk v1.1.0 · 记录保存在本机，稿件保留在原文件夹</footer>
   </main>
   <div id="drawer-layer" class="drawer-layer" hidden>
     <div class="scrim" data-action="close-drawer"></div>

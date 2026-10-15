@@ -1,0 +1,62 @@
+{
+  "app": "paperdesk-local-v1",
+  "schema_version": 1,
+  "exported_at": "2026-10-15T09:25:56.214090+08:00",
+  "data": {
+    "journals": [
+      {
+        "id": 1,
+        "name": "原版测试期刊",
+        "url": "https://example.com/submit",
+        "notes": "",
+        "updated_at": "2026-10-15T09:25:56.147362+08:00"
+      },
+      {
+        "id": 2,
+        "name": "原版候选期刊",
+        "url": "",
+        "notes": "",
+        "updated_at": "2026-10-15T09:25:56.161612+08:00"
+      }
+    ],
+    "papers": [
+      {
+        "id": 1,
+        "title": "第一版兼容测试",
+        "authors": "测试作者",
+        "tags": "",
+        "stage": "submitted",
+        "notes": "",
+        "folder": "",
+        "created_at": "2026-10-15T09:25:56.175047+08:00",
+        "updated_at": "2026-10-15T09:25:56.200536+08:00"
+      }
+    ],
+    "files": [],
+    "submissions": [
+      {
+        "id": 1,
+        "paper_id": 1,
+        "journal_id": 1,
+        "submitted_on": "2024-02-28",
+        "manuscript_number": "",
+        "progress": "",
+        "notes": "",
+        "ended_on": null,
+        "result": null,
+        "transfer_mode": "days",
+        "wait_days": 30,
+        "target_on": "2024-03-29",
+        "created_at": "2026-10-15T09:25:56.200536+08:00",
+        "updated_at": "2026-10-15T09:25:56.200536+08:00"
+      }
+    ],
+    "candidates": [
+      {
+        "submission_id": 1,
+        "journal_id": 2,
+        "position": 0
+      }
+    ]
+  }
+}

@@ -20,8 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_ID = "paperdesk-local-v1"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ROOT = Path(__file__).resolve().parent
+VERSION_PATH = ROOT / "VERSION"
+APP_VERSION = VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.exists() else "1.0.0"
+DEFAULT_PORT = 8766
 CHINA = dt.timezone(dt.timedelta(hours=8))
 STAGES = ("planned", "writing", "submitted", "revision", "accepted", "archived")
 STAGE_NAMES = dict(zip(STAGES, ("计划中", "正在写", "已投稿", "退修中", "已录用/发表", "归档")))
@@ -37,7 +40,9 @@ CREATE TABLE IF NOT EXISTS papers (
  tags TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL CHECK(stage IN
  ('planned','writing','submitted','revision','accepted','archived')),
  notes TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT '',
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ planned_on TEXT, writing_started_on TEXT,
+ target_journal_id INTEGER REFERENCES journals(id));
 CREATE TABLE IF NOT EXISTS files (
  id INTEGER PRIMARY KEY, paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
  label TEXT NOT NULL, path TEXT NOT NULL, UNIQUE(paper_id,path));
@@ -55,7 +60,7 @@ CREATE TABLE IF NOT EXISTS candidates (
  submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
  journal_id INTEGER NOT NULL REFERENCES journals(id), position INTEGER NOT NULL,
  PRIMARY KEY(submission_id,position), UNIQUE(submission_id,journal_id));
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 """
 
 
@@ -183,9 +188,22 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
-            raise ValidationError("数据库版本不兼容，请保留文件并使用对应版本的平台。")
-        self.conn.executescript(SCHEMA)
+        try:
+            if version not in (0, 1, SCHEMA_VERSION):
+                raise ValidationError("数据库版本不兼容，请保留文件并使用对应版本的平台。")
+            if version == 1:
+                self.snapshot("upgrade")
+                self.conn.executescript("""BEGIN IMMEDIATE;
+                    ALTER TABLE papers ADD COLUMN planned_on TEXT;
+                    ALTER TABLE papers ADD COLUMN writing_started_on TEXT;
+                    ALTER TABLE papers ADD COLUMN target_journal_id INTEGER REFERENCES journals(id);
+                    PRAGMA user_version = 2;
+                    COMMIT;""")
+            self.conn.executescript(SCHEMA)
+        except Exception:
+            self.conn.rollback()
+            self.conn.close()
+            raise
 
     def close(self):
         self.conn.close()
@@ -253,9 +271,9 @@ class Store:
     def journal_delete(self, record_id):
         def action():
             self.require("journals", record_id)
-            if self.conn.execute("SELECT 1 FROM submissions WHERE journal_id=? UNION SELECT 1 FROM candidates WHERE journal_id=?",
-                                 (record_id, record_id)).fetchone():
-                raise ValidationError("这个期刊已用于投稿或候选计划，请先修改相关记录。")
+            if self.conn.execute("SELECT 1 FROM submissions WHERE journal_id=? UNION SELECT 1 FROM candidates WHERE journal_id=? UNION SELECT 1 FROM papers WHERE target_journal_id=?",
+                                 (record_id, record_id, record_id)).fetchone():
+                raise ValidationError("这个期刊已用于初始目标、投稿或转投计划，请先修改相关记录。")
             self.conn.execute("DELETE FROM journals WHERE id=?", (record_id,))
         self.mutate(action, "delete")
 
@@ -267,6 +285,18 @@ class Store:
                   "folder": checked_path(text_field(data, "folder", limit=4000), True)}
         if fields["stage"] not in STAGES:
             raise ValidationError("请选择有效的论文阶段。")
+        for key, label in (("planned_on", "计划建立日期"), ("writing_started_on", "开始撰写日期")):
+            if key in data:
+                value = data[key]
+                if value is not None and value != "":
+                    date = parse_date(value, label)
+                    if date > self.day_provider():
+                        raise ValidationError(f"{label}不能晚于今天。")
+                    fields[key] = date.isoformat()
+                else:
+                    fields[key] = None
+        if "target_journal_id" in data:
+            fields["target_journal_id"] = None if data["target_journal_id"] in (None, "") else positive_id(data["target_journal_id"])
         files = data.get("files", [])
         if not isinstance(files, list) or len(files) > 100:
             raise ValidationError("稿件文件列表无效。")
@@ -282,19 +312,34 @@ class Store:
         def action():
             nonlocal record_id
             active = None
+            previous = None
             if record_id:
-                self.require("papers", record_id)
+                previous = self.require("papers", record_id)
                 active = self.conn.execute("SELECT id FROM submissions WHERE paper_id=? AND ended_on IS NULL", (record_id,)).fetchone()
             if fields["stage"] in ("submitted", "revision") and not active:
                 raise ValidationError("请先在论文详情中登记投稿，再设置为已投稿或退修中。")
             if active and fields["stage"] not in ("submitted", "revision", "archived"):
                 raise ValidationError("请先结束当前投稿；录用时选择结果“录用”，平台会自动更新阶段。")
+            for key, phase in (("planned_on", "planned"), ("writing_started_on", "writing")):
+                if key not in fields:
+                    value = previous[key] if previous else None
+                    if not value and fields["stage"] == phase and (not previous or previous["stage"] != phase):
+                        value = self.day_provider().isoformat()
+                    fields[key] = value
+            fields.setdefault("target_journal_id", previous["target_journal_id"] if previous else None)
+            if fields["target_journal_id"] is not None:
+                self.require("journals", fields["target_journal_id"])
+            if fields["planned_on"] and fields["writing_started_on"] and fields["writing_started_on"] < fields["planned_on"]:
+                raise ValidationError("开始撰写日期不能早于计划建立日期。")
             stamp = timestamp()
             if record_id:
-                self.conn.execute("UPDATE papers SET title=?,authors=?,tags=?,stage=?,notes=?,folder=?,updated_at=? WHERE id=?",
+                assignments = ",".join(f"{key}=?" for key in fields)
+                self.conn.execute(f"UPDATE papers SET {assignments},updated_at=? WHERE id=?",
                                   (*fields.values(), stamp, record_id))
             else:
-                record_id = self.conn.execute("INSERT INTO papers(title,authors,tags,stage,notes,folder,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                columns = ",".join(fields)
+                placeholders = ",".join("?" for _ in fields)
+                record_id = self.conn.execute(f"INSERT INTO papers({columns},created_at,updated_at) VALUES({placeholders},?,?)",
                                               (*fields.values(), stamp, stamp)).lastrowid
             self.conn.execute("DELETE FROM files WHERE paper_id=?", (record_id,))
             self.conn.executemany("INSERT INTO files(paper_id,label,path) VALUES(?,?,?)",
@@ -383,9 +428,16 @@ class Store:
         record["overdue_days"] = max(0, (current - due).days) if due and not record["ended_on"] and stage not in ("accepted", "archived") else 0
         return record
 
+    def decorate_paper(self, paper):
+        paper["target_journal"] = self.require("journals", paper["target_journal_id"]) if paper["target_journal_id"] else None
+        key = {"planned": "planned_on", "writing": "writing_started_on"}.get(paper["stage"])
+        paper["stage_started_on"] = paper[key] if key else None
+        paper["stage_elapsed_days"] = (self.day_provider() - dt.date.fromisoformat(paper[key])).days if key and paper[key] else None
+        return paper
+
     def paper_detail(self, record_id):
         with self.lock:
-            paper = self.require("papers", record_id)
+            paper = self.decorate_paper(self.require("papers", record_id))
             paper["files"] = self.rows("SELECT * FROM files WHERE paper_id=? ORDER BY id", (record_id,))
             paper["submissions"] = [self.decorate_submission(r, paper["stage"]) for r in self.rows(
                 "SELECT * FROM submissions WHERE paper_id=? ORDER BY submitted_on DESC,id DESC", (record_id,))]
@@ -396,6 +448,7 @@ class Store:
             papers = self.rows("SELECT * FROM papers ORDER BY updated_at DESC,id DESC")
             counts = {phase: 0 for phase in STAGES}
             for paper in papers:
+                self.decorate_paper(paper)
                 counts[paper["stage"]] += 1
                 rounds = self.rows("SELECT * FROM submissions WHERE paper_id=? ORDER BY submitted_on DESC,id DESC", (paper["id"],))
                 active = next((r for r in rounds if not r["ended_on"]), None)
@@ -409,15 +462,15 @@ class Store:
             return {"papers": papers, "journals": journals, "counts": counts,
                     "today": self.day_provider().isoformat(), "overdue_count": sum(p["overdue_days"] > 0 for p in papers),
                     "data_dir": str(self.directory), "database_path": str(self.path),
-                    "backup_dir": str(self.backup_dir), "backups": self.backups()}
+                    "backup_dir": str(self.backup_dir), "backups": self.backups(), "app_version": APP_VERSION}
 
     def export(self):
         with self.lock:
-            return {"app": APP_ID, "schema_version": SCHEMA_VERSION, "exported_at": timestamp(),
+            return {"app": APP_ID, "app_version": APP_VERSION, "schema_version": SCHEMA_VERSION, "exported_at": timestamp(),
                     "data": {table: self.rows(f"SELECT * FROM {table} ORDER BY " + ("submission_id,position" if table == "candidates" else "id")) for table in TABLES}}
 
     def validate_export(self, payload):
-        if not isinstance(payload, dict) or payload.get("app") != APP_ID or payload.get("schema_version") != SCHEMA_VERSION:
+        if not isinstance(payload, dict) or payload.get("app") != APP_ID or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, SCHEMA_VERSION):
             raise ValidationError("这不是本平台支持的备份文件。")
         data = payload.get("data")
         if not isinstance(data, dict) or set(data) != set(TABLES):
@@ -425,6 +478,7 @@ class Store:
         for name in TABLES:
             if not isinstance(data[name], list) or len(data[name]) > 100000:
                 raise ValidationError("备份数据格式或大小无效。")
+        data = {name: [dict(row) if isinstance(row, dict) else row for row in data[name]] for name in TABLES}
         journals = set()
         papers = {}
         rounds = {}
@@ -443,6 +497,9 @@ class Store:
         for row in data["papers"]:
             if not isinstance(row, dict):
                 raise ValidationError("论文备份格式无效。")
+            if payload["schema_version"] == 1:
+                for key in ("planned_on", "writing_started_on", "target_journal_id"):
+                    row.setdefault(key, None)
             ident = positive_id(row.get("id"))
             if ident in papers or row.get("stage") not in STAGES:
                 raise ValidationError("备份包含重复论文或无效阶段。")
@@ -454,6 +511,13 @@ class Store:
             checked_path(text_field(row, "folder", limit=4000), True)
             for key in ("created_at", "updated_at"):
                 text_field(row, key, True, 100)
+            for key, label in (("planned_on", "计划建立日期"), ("writing_started_on", "开始撰写日期")):
+                if row.get(key) is not None and parse_date(row[key], label) > self.day_provider():
+                    raise ValidationError(f"备份中的{label}不能晚于今天。")
+            if row.get("planned_on") and row.get("writing_started_on") and row["writing_started_on"] < row["planned_on"]:
+                raise ValidationError("备份中的开始撰写日期早于计划建立日期。")
+            if row.get("target_journal_id") is not None and positive_id(row["target_journal_id"]) not in journals:
+                raise ValidationError("备份中的初始目标期刊关联无效。")
         active_papers = set()
         for row in data["submissions"]:
             if not isinstance(row, dict):
@@ -549,9 +613,10 @@ class Store:
             try:
                 connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
                 connection.row_factory = sqlite3.Row
-                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or version not in (1, SCHEMA_VERSION):
                     raise ValidationError("自动备份损坏或版本不兼容。")
-                payload = {"app": APP_ID, "schema_version": SCHEMA_VERSION,
+                payload = {"app": APP_ID, "schema_version": version,
                            "data": {table: [dict(r) for r in connection.execute(f"SELECT * FROM {table}")] for table in TABLES}}
             except sqlite3.Error:
                 raise ValidationError("无法读取这份备份，当前数据没有被修改。") from None
@@ -627,14 +692,14 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         try:
             if route == "/api/health":
-                self.reply(200, {"app": APP_ID, "status": "ok"})
+                self.reply(200, {"app": APP_ID, "version": APP_VERSION, "status": "ok"})
             elif route == "/api/state":
                 self.reply(200, {**store.state(), "token": self.server.token})
             elif route.startswith("/api/papers/") and route.rsplit("/", 1)[1].isdigit():
                 self.reply(200, store.paper_detail(int(route.rsplit("/", 1)[1])))
             elif route == "/api/export":
                 self.reply(200, store.export(), attachment=f"paperdesk-backup-{today().isoformat()}.json")
-            elif route in ("/", "/index.html", "/app.js", "/style.css", "/interaction.css", "/favicon.svg"):
+            elif route in ("/", "/index.html", "/app.js", "/style.css", "/interaction.css", "/icons.svg", "/favicon.svg"):
                 filename = "index.html" if route == "/" else route[1:]
                 types = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
@@ -786,7 +851,7 @@ def existing_url(directory):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=default_data_dir())
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     # Keep the nominal user path stable across packaged and normal Windows launches.

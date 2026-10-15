@@ -4,6 +4,7 @@ const stages = {planned:'计划中',writing:'正在写',submitted:'已投稿',re
 const results = {accepted:'录用',rejected:'退稿',withdrawn:'撤稿',other:'其他结束'};
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const icon = (name,className='') => `<svg class="icon ${className}" aria-hidden="true"><use href="/icons.svg#${name}"></use></svg>`;
 let state = null;
 let currentView = 'papers';
 let filters = {search:'',stage:'',journal:'',overdue:false,sort:'recent'};
@@ -42,7 +43,8 @@ function toast(message,error=false) {
 async function refresh(render=true) {
   state = await api('/api/state');
   disconnected = false;
-  $('today').textContent = state.today.replace(/-/g,'.') + ' · 北京时间';
+  $('today').textContent = state.today.replace(/-/g,'.');
+  document.querySelector('footer').textContent = `PaperDesk v${state.app_version || '1.0.0'} · 记录保存在本机，稿件保留在原文件夹`;
   if (render) renderView();
 }
 
@@ -51,7 +53,7 @@ function journalAnchor(journal, label) {
   if (journal.url) return `<a class="journal-link" href="${esc(journal.url)}" target="_blank" rel="noopener noreferrer">${esc(label || journal.name)} <span aria-hidden="true">↗</span></a>`;
   return `<span class="journal-link">${esc(label || journal.name)}</span><button class="link-button subtle" data-action="edit-journal" data-id="${journal.id}">设置投稿入口</button>`;
 }
-function header(title,subtitle,action) {return `<header class="page-header"><div><div class="eyebrow">MY RESEARCH</div><h1>${title}</h1><p>${subtitle}</p></div>${action || ''}</header>`;}
+function header(title,subtitle,action) {return `<header class="page-header"><div><h1>${title}</h1><p>${subtitle}</p></div>${action || ''}</header>`;}
 function renderView() {
   document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===currentView));
   if (currentView==='journals') renderJournals();
@@ -64,7 +66,7 @@ function renderPapers() {
   `<div class="stats">${Object.entries(stages).map(([key,label])=>`<button class="stat ${key} ${filters.stage===key?'selected':''}" data-action="filter-stage" data-stage="${key}" aria-label="查看${label}论文"><span class="stat-name"><span class="stat-marker"></span>${label}</span><strong>${state.counts[key]}<small>篇</small></strong></button>`).join('')}</div>` +
   (state.overdue_count?`<div class="overdue-strip"><span aria-hidden="true">◷</span><span>${state.overdue_count} 篇论文超过计划转投时间，可以继续等待或调整计划。</span><button class="link-button" data-action="show-overdue">查看记录 →</button></div>`:'') +
   `<section class="panel"><div class="panel-title"><h2>我的论文</h2><span id="paper-total"></span></div>
-  <div class="toolbar"><div class="searchbox"><span class="search-icon" aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索论文标题、作者或标签" value="${esc(filters.search)}" aria-label="搜索论文"></div>
+  <div class="toolbar"><div class="searchbox">${icon('search','search-icon')}<input id="search" type="search" placeholder="搜索论文标题、作者或标签" value="${esc(filters.search)}" aria-label="搜索论文"></div>
   <select id="stage-filter" aria-label="按阶段筛选"><option value="">全部阶段</option>${Object.entries(stages).map(([k,v])=>`<option value="${k}" ${filters.stage===k?'selected':''}>${v}</option>`).join('')}</select>
   <select id="journal-filter" aria-label="按期刊筛选"><option value="">全部期刊</option>${state.journals.map(j=>`<option value="${j.id}" ${filters.journal===String(j.id)?'selected':''}>${esc(j.name)}</option>`).join('')}</select>
   <label class="filter-toggle"><input type="checkbox" id="overdue-filter" ${filters.overdue?'checked':''}>仅超期</label></div>
@@ -79,12 +81,18 @@ function renderPapers() {
 }
 
 function syncStats() {document.querySelectorAll('.stat').forEach(b=>b.classList.toggle('selected',b.dataset.stage===filters.stage));}
+function earlyStage(p) {return p.stage==='planned'||p.stage==='writing';}
+function listedJournal(p) {
+  if(earlyStage(p))return p.target_journal;
+  const r=p.current_submission;
+  return r?{id:r.journal_id,name:r.journal_name,url:r.journal_url}:null;
+}
 function renderPaperTable() {
   const query=filters.search.trim().toLocaleLowerCase();
   const papers=state.papers.filter(p=>
     (!query || [p.title,p.authors,p.tags].join(' ').toLocaleLowerCase().includes(query)) &&
     (!filters.stage || p.stage===filters.stage) &&
-    (!filters.journal || p.current_submission?.journal_id===Number(filters.journal)) &&
+    (!filters.journal || listedJournal(p)?.id===Number(filters.journal)) &&
     (!filters.overdue || p.overdue_days>0));
   if (filters.sort==='wait') papers.sort((a,b)=>(b.current_submission?.elapsed_days??-1)-(a.current_submission?.elapsed_days??-1));
   else if(filters.sort==='due') papers.sort((a,b)=>(a.current_submission?.target_on||'9999').localeCompare(b.current_submission?.target_on||'9999'));
@@ -96,14 +104,18 @@ function renderPaperTable() {
       `<div class="empty"><div class="empty-icon" aria-hidden="true">▤</div><h3>从第一篇论文开始</h3><p>记录正在写的想法，或已经投出的稿件。<br>投稿历史和转投安排，会一起保留在这里。</p><button class="button primary" data-action="new-paper">＋ 新建论文</button></div>`;
     return;
   }
-  $('paper-table').innerHTML=`<div class="table-wrap"><table class="papers-table"><thead><tr><th>论文标题</th><th>阶段</th><th>期刊 / 投稿入口</th><th>投稿日期</th><th>等待天数</th><th>计划转投</th><th>下一目标期刊</th></tr></thead><tbody>${papers.map(p=>{
+  const dateTitle=filters.stage==='planned'?'计划建立日期':filters.stage==='writing'?'开始撰写日期':filters.stage?'投稿日期':'阶段起始日期';
+  const daysTitle=filters.stage==='planned'?'已历时':filters.stage==='writing'?'写作天数':filters.stage?'等待天数':'阶段用时';
+  $('paper-table').innerHTML=`<div class="table-wrap"><table class="papers-table"><thead><tr><th>论文标题</th><th>阶段</th><th>${['planned','writing'].includes(filters.stage)?'初始目标期刊':'期刊'} / 投稿入口</th><th>${dateTitle}</th><th>${daysTitle}</th><th>计划转投</th><th>转投候选期刊</th></tr></thead><tbody>${papers.map(p=>{
     const r=p.current_submission;
-    const j=r?{id:r.journal_id,name:r.journal_name,url:r.journal_url}:null;
+    const early=earlyStage(p),j=listedJournal(p),plan=early?null:r;
+    const date=early?p.stage_started_on:r?.submitted_on,days=early?p.stage_elapsed_days:r?.elapsed_days;
+    const dateLabel=p.stage==='planned'?'计划建立':p.stage==='writing'?'开始撰写':'投稿日期';
     return `<tr><td><button class="paper-title" data-action="paper-detail" data-id="${p.id}">${esc(p.title)}</button><div class="paper-meta">${esc(p.authors||'作者未填写')}${p.tags?` · ${esc(p.tags)}`:''}${p.round_count?`<br>${p.round_count} 轮投稿记录`:''}</div></td>
-      <td>${stagePill(p.stage)}</td><td>${j?journalAnchor(j):'<span class="subtle">尚未登记投稿</span>'}${r?.ended_on?'<div class="paper-meta">上轮 · 已结束</div>':''}</td>
-      <td class="cell-date">${r?esc(r.submitted_on):'—'}</td><td>${r?`<span class="days">${r.elapsed_days}<small>天</small></span>${r.ended_on?'<div class="paper-meta">该轮总等待</div>':''}`:'<span class="subtle">—</span>'}</td>
-      <td class="cell-date">${r?.target_on?esc(r.target_on):'<span class="subtle">未设置</span>'}${p.overdue_days?`<br><span class="overdue-badge">超过计划时间 ${p.overdue_days} 天</span>`:''}${r?.ended_on&&r.target_on?'<div class="paper-meta">上轮计划</div>':''}</td>
-      <td>${r?.candidates?.length?journalAnchor(r.candidates[0]):'<span class="subtle">—</span>'}${r?.candidates?.length>1?`<div class="paper-meta">另有 ${r.candidates.length-1} 个候选</div>`:''}</td></tr>`;
+      <td>${stagePill(p.stage)}</td><td>${j?journalAnchor(j):`<span class="subtle">${early?'未设置目标期刊':'尚未登记投稿'}</span>`}${early?'<div class="paper-meta">初始目标期刊</div>':r?.ended_on?'<div class="paper-meta">上轮 · 已结束</div>':''}</td>
+      <td class="cell-date">${date?esc(date):'<span class="subtle">未设置</span>'}${!filters.stage?`<div class="paper-meta">${dateLabel}</div>`:''}</td><td>${days!=null?`<span class="days">${days}<small>天</small></span><div class="paper-meta">${p.stage==='planned'?'已历时':p.stage==='writing'?'写作天数':r?.ended_on?'该轮总等待':'已等待'}</div>`:'<span class="subtle">—</span>'}</td>
+      <td class="cell-date">${plan?.target_on?esc(plan.target_on):`<span class="subtle">${early?'—':'未设置'}</span>`}${p.overdue_days?`<br><span class="overdue-badge">超过计划时间 ${p.overdue_days} 天</span>`:''}${plan?.ended_on&&plan.target_on?'<div class="paper-meta">上轮计划</div>':''}</td>
+      <td>${plan?.candidates?.length?journalAnchor(plan.candidates[0]):'<span class="subtle">—</span>'}${plan?.candidates?.length>1?`<div class="paper-meta">另有 ${plan.candidates.length-1} 个候选</div>`:''}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -117,6 +129,7 @@ function backupLabel(name) {
   if(name.startsWith('daily-'))return '每日自动备份';
   if(name.startsWith('delete-'))return '删除前备份';
   if(name.startsWith('restore-'))return '恢复前备份';
+  if(name.startsWith('upgrade-'))return '升级前备份';
   return '本机备份';
 }
 
@@ -164,7 +177,7 @@ async function paperDetail(id, expectedGeneration=null) {
   if(expectedGeneration!==null && drawerGeneration!==expectedGeneration)return;
   const active=p.submissions.find(r=>!r.ended_on);
   showDrawer(drawerHeader(p.title,'论文详情')+`<div class="drawer-body"><div class="detail-top">${stagePill(p.stage)}<span class="muted">${p.submissions.length} 轮投稿</span><button class="button secondary small" data-action="edit-paper" data-id="${p.id}">编辑论文信息</button></div>
-    <dl class="detail-meta"><dt>作者</dt><dd>${esc(p.authors||'未填写')}</dd><dt>标签</dt><dd>${esc(p.tags||'未填写')}</dd><dt>更新时间</dt><dd>${esc(p.updated_at.slice(0,16).replace('T',' '))}</dd></dl>
+    <dl class="detail-meta"><dt>作者</dt><dd>${esc(p.authors||'未填写')}</dd><dt>标签</dt><dd>${esc(p.tags||'未填写')}</dd><dt>初始目标期刊</dt><dd>${p.target_journal?journalAnchor(p.target_journal):'未设置'}</dd><dt>计划建立日期</dt><dd>${esc(p.planned_on||'未设置')}</dd><dt>开始撰写日期</dt><dd>${esc(p.writing_started_on||'未设置')}</dd>${earlyStage(p)?`<dt>${p.stage==='planned'?'已历时':'写作天数'}</dt><dd>${p.stage_elapsed_days==null?'未设置起始日期':p.stage_elapsed_days+' 天'}</dd>`:''}<dt>更新时间</dt><dd>${esc(p.updated_at.slice(0,16).replace('T',' '))}</dd></dl>
     ${p.notes?`<div class="detail-note">${esc(p.notes)}</div>`:''}
     <div class="section-heading">论文文件${p.folder?`<button class="link-button" data-action="open-folder" data-id="${p.id}">打开文件夹 ↗</button>`:''}</div>
     ${p.folder?`<div class="path-block">${esc(p.folder)}</div>`:''}
@@ -176,13 +189,16 @@ async function paperDetail(id, expectedGeneration=null) {
 
 function fileEditRow(f={}) {return `<div class="file-edit-row" data-file-row><div class="file-row-top"><input class="file-label" placeholder="稿件名称，例如投稿终稿" aria-label="稿件名称" value="${esc(f.label||'')}" maxlength="200"><button class="icon-button" type="button" data-action="remove-file-row" aria-label="移除稿件关联">×</button></div><div class="inline-input"><input class="file-path" required placeholder="稿件完整路径" aria-label="稿件路径" value="${esc(f.path||'')}" maxlength="4000"><button class="button secondary small" type="button" data-action="pick-file">选择文件</button></div></div>`;}
 async function paperForm(id) {
-  const p=id?await api(`/api/papers/${id}`):{title:'',authors:'',tags:'',stage:'writing',notes:'',folder:'',files:[],submissions:[]};
+  const p=id?await api(`/api/papers/${id}`):{title:'',authors:'',tags:'',stage:'writing',notes:'',folder:'',planned_on:null,writing_started_on:state.today,target_journal_id:null,files:[],submissions:[]};
   const active=p.submissions.some(r=>!r.ended_on);
   const allowed=active?['submitted','revision','archived']:['planned','writing','accepted','archived'];
   showDrawer(drawerHeader(id?'编辑论文':'新建论文',id?'论文信息':'从一篇论文开始')+`<div class="drawer-body"><form id="paper-form"><div id="form-error" class="form-error" hidden></div>
     <div class="form-field"><label for="p-title">论文标题 <span class="required">*</span></label><input id="p-title" required maxlength="500" placeholder="填写论文标题" value="${esc(p.title)}"></div>
     <div class="form-grid"><div class="form-field"><label for="p-authors">作者</label><input id="p-authors" maxlength="1000" placeholder="作者姓名" value="${esc(p.authors)}"></div><div class="form-field"><label for="p-stage">论文阶段</label><select id="p-stage">${Object.entries(stages).map(([k,v])=>`<option value="${k}" ${p.stage===k?'selected':''} ${!allowed.includes(k)?'disabled':''}>${v}</option>`).join('')}</select></div></div>
     <p class="field-help">${active?'当前有进行中的投稿。录用或退稿时，请在投稿历史中“结束本轮”。':'登记投稿后，阶段会自动变为“已投稿”。'}</p>
+    <div class="form-field"><label for="p-target-journal">初始目标期刊</label><select id="p-target-journal" class="journal-select">${journalOptions(p.target_journal_id,'暂不设置')}</select><small>最初计划投稿的期刊，独立于每轮投稿和转投候选，可随时修改。</small></div>
+    ${quickJournalForm('p-target-journal')}
+    <div class="form-grid"><div class="form-field"><label for="p-planned-on">计划建立日期</label><input id="p-planned-on" type="date" max="${state.today}" value="${esc(p.planned_on||'')}"></div><div class="form-field"><label for="p-writing-on">开始撰写日期</label><input id="p-writing-on" type="date" max="${state.today}" value="${esc(p.writing_started_on||'')}"></div></div><p class="field-help">从对应日期开始计时，当天为第 0 天；可以补填或留空。</p>
     <div class="form-field"><label for="p-tags">标签</label><input id="p-tags" maxlength="1000" placeholder="例如：人工智能、跨学科、教学设计" value="${esc(p.tags)}"></div>
     <div class="form-field"><label for="p-notes">备注</label><textarea id="p-notes" maxlength="10000" placeholder="写作思路、修改安排或刊出信息…">${esc(p.notes)}</textarea></div>
     <div class="section-heading">本地文件关联</div><div class="form-field"><label for="p-folder">论文文件夹</label><div class="inline-input"><input id="p-folder" maxlength="4000" placeholder="粘贴完整路径，或选择文件夹" value="${esc(p.folder)}"><button class="button secondary small" type="button" data-action="pick-folder">选择</button></div></div>
@@ -190,6 +206,11 @@ async function paperForm(id) {
     ${id?`<div class="section-heading">记录管理</div><p class="field-help">暂时不需要的论文可以设为归档，所有历史继续保留。</p><button class="button danger small" type="button" data-action="delete-paper" data-id="${id}">删除论文及投稿记录</button>`:''}
     </form></div>`+formActions('paper-form'),{kind:'paper-form',paperId:id||null});
   $('paper-form').addEventListener('submit',savePaper);
+  $('p-stage').addEventListener('change',()=>{
+    if($('p-stage').value==='planned'&&!$('p-planned-on').value)$('p-planned-on').value=state.today;
+    if($('p-stage').value==='writing'&&!$('p-writing-on').value)$('p-writing-on').value=state.today;
+    if(!id&&$('p-stage').value==='planned'&&$('p-writing-on').value===state.today)$('p-writing-on').value='';
+  });
 }
 
 async function savePaper(event) {
@@ -199,6 +220,7 @@ async function savePaper(event) {
   button.disabled=true;
   try {
     const data={title:$('p-title').value,authors:$('p-authors').value,tags:$('p-tags').value,stage:$('p-stage').value,notes:$('p-notes').value,folder:$('p-folder').value,
+      target_journal_id:$('p-target-journal').value?Number($('p-target-journal').value):null,planned_on:$('p-planned-on').value||null,writing_started_on:$('p-writing-on').value||null,
       files:[...document.querySelectorAll('[data-file-row]')].map(row=>({label:row.querySelector('.file-label').value,path:row.querySelector('.file-path').value}))};
     const id=drawerInfo.paperId;
     const saved=await api(id?`/api/papers/${id}`:'/api/papers',id?'PUT':'POST',data);
@@ -222,21 +244,22 @@ function journalForm(id) {
   });
 }
 
-function journalOptions(selected='') {return `<option value="">请选择期刊</option>${state.journals.map(j=>`<option value="${j.id}" ${Number(selected)===j.id?'selected':''}>${esc(j.name)}</option>`).join('')}`;}
+function journalOptions(selected='',emptyLabel='请选择期刊') {return `<option value="">${emptyLabel}</option>${state.journals.map(j=>`<option value="${j.id}" ${Number(selected)===j.id?'selected':''}>${esc(j.name)}</option>`).join('')}`;}
+function quickJournalForm(target) {return `<details class="subform-box"><summary>＋ 快速新增期刊</summary><div class="form-field"><label for="quick-name">期刊名称</label><input id="quick-name" maxlength="200" placeholder="期刊名称"></div><div class="form-field"><label for="quick-url">投稿管理页链接（可选）</label><input id="quick-url" type="url" maxlength="3000" placeholder="https://…"></div><button class="button secondary small" type="button" data-action="quick-journal" data-target="${target}">保存并选择期刊</button></details>`;}
 function candidateRow(id='') {return `<div class="candidate-row" data-candidate-row><span class="candidate-number"></span><select class="journal-select candidate-select" required aria-label="候选期刊">${journalOptions(id)}</select><button type="button" class="icon-button" data-action="candidate-up" aria-label="向前移动候选期刊">↑</button><button type="button" class="icon-button" data-action="candidate-down" aria-label="向后移动候选期刊">↓</button><button type="button" class="icon-button" data-action="remove-candidate" aria-label="移除候选期刊">×</button></div>`;}
 function syncCandidateNumbers(){document.querySelectorAll('[data-candidate-row]').forEach((r,i)=>{r.querySelector('.candidate-number').textContent=i+1;r.querySelector('[data-action="candidate-up"]').disabled=i===0;r.querySelector('[data-action="candidate-down"]').disabled=i===document.querySelectorAll('[data-candidate-row]').length-1;});}
 
 async function submissionForm(paperId,roundId,end=false) {
   const p=await api(`/api/papers/${paperId}`);
   const active=p.submissions.find(r=>!r.ended_on);
-  const r=roundId?p.submissions.find(r=>r.id===roundId):{submitted_on:state.today,journal_id:'',manuscript_number:'',progress:'',notes:'',transfer_mode:'none',wait_days:'',target_on:'',ended_on:null,result:null,candidates:[]};
+  const r=roundId?p.submissions.find(r=>r.id===roundId):{submitted_on:state.today,journal_id:p.submissions.length?'':p.target_journal_id||'',manuscript_number:'',progress:'',notes:'',transfer_mode:'none',wait_days:'',target_on:'',ended_on:null,result:null,candidates:[]};
   if(!r)throw new Error('投稿记录不存在，请刷新页面。');
   const historyOnly=!roundId&&!!active;
   const closed=!!r.ended_on||end||historyOnly;
   showDrawer(drawerHeader(end?'结束本轮投稿':roundId?'编辑投稿记录':historyOnly?'补录投稿历史':'登记投稿',p.title)+`<div class="drawer-body"><form id="submission-form"><div id="form-error" class="form-error" hidden></div>
     ${historyOnly?'<div class="mini-banner">这篇论文已有进行中的投稿。这里可补录已结束的历史；转投前请先结束当前轮次。</div>':''}
     <div class="form-field"><label for="s-journal">投稿期刊 <span class="required">*</span></label><select id="s-journal" class="journal-select" required>${journalOptions(r.journal_id)}</select><small>没有找到期刊？可在下方直接新增。</small></div>
-    <details class="subform-box"><summary>＋ 快速新增期刊</summary><div class="form-field"><label for="quick-name">期刊名称</label><input id="quick-name" maxlength="200" placeholder="期刊名称"></div><div class="form-field"><label for="quick-url">投稿管理页链接（可选）</label><input id="quick-url" type="url" maxlength="3000" placeholder="https://…"></div><button class="button secondary small" type="button" data-action="quick-journal">保存并选择期刊</button></details>
+    ${quickJournalForm('s-journal')}
     <div class="form-grid"><div class="form-field"><label for="s-date">投稿日期 <span class="required">*</span></label><input id="s-date" type="date" required max="${state.today}" value="${esc(r.submitted_on)}"></div><div class="form-field"><label for="s-number">稿件编号</label><input id="s-number" maxlength="200" placeholder="选填" value="${esc(r.manuscript_number)}"></div></div>
     <div class="section-heading">投稿进展</div><div class="form-field"><label for="s-progress">当前进展</label><input id="s-progress" maxlength="1000" placeholder="例如：已收稿、外审中、已提交修改稿" value="${esc(r.progress)}"></div>
     <div class="form-field"><label for="s-status">本轮状态</label><select id="s-status"><option value="active" ${!closed?'selected':''} ${historyOnly?'disabled':''}>进行中</option><option value="closed" ${closed?'selected':''}>已结束</option></select></div>
@@ -245,7 +268,7 @@ async function submissionForm(paperId,roundId,end=false) {
     <div id="wait-field" class="form-field"><label for="s-wait">等待天数</label><input id="s-wait" type="number" min="1" max="3650" step="1" placeholder="例如：60" value="${esc(r.wait_days??'')}"><small id="due-preview"></small></div>
     <div id="target-field" class="form-field"><label for="s-target">计划转投日期</label><input id="s-target" type="date" value="${esc(r.target_on||'')}"></div>
     <p class="field-help">只在超过计划日期后显示提示。可以继续等待、调整日期，或随时关闭计划。</p>
-    <div class="section-heading">候选期刊 <button class="link-button" type="button" data-action="add-candidate">＋ 添加</button></div><div id="candidate-rows">${r.candidates.map(j=>candidateRow(j.id)).join('')}</div><p class="field-help">按顺序保存；第一个候选显示为下一目标期刊。</p>
+    <div class="section-heading">转投候选期刊 <button class="link-button" type="button" data-action="add-candidate">＋ 添加</button></div><div id="candidate-rows">${r.candidates.map(j=>candidateRow(j.id)).join('')}</div><p class="field-help">按顺序保存；第一个候选显示在列表中，与论文的初始目标期刊分别记录。</p>
     <div class="form-field"><label for="s-notes">本轮备注</label><textarea id="s-notes" maxlength="10000" placeholder="编辑部反馈、联系记录或转投考虑…">${esc(r.notes)}</textarea></div>
     ${roundId?`<button class="button danger small" type="button" data-action="delete-submission" data-id="${roundId}" data-paper="${paperId}">删除这轮记录</button>`:''}</form></div>`+formActions('submission-form','返回详情'),{kind:'submission-form',paperId,roundId:roundId||null});
   $('s-status').addEventListener('change',syncSubmissionFields);
@@ -293,7 +316,7 @@ $('modal-cancel').addEventListener('click',()=>resolveModal(false));
 $('modal-ok').addEventListener('click',()=>resolveModal(true));
 
 async function restorePayload(payload) {
-  if(payload?.app!=='paperdesk-local-v1'||payload.schema_version!==1||!payload.data)throw new Error('请选择本平台导出的完整 JSON 备份。');
+  if(payload?.app!=='paperdesk-local-v1'||![1,2].includes(payload.schema_version)||!payload.data)throw new Error('请选择本平台导出的完整 JSON 备份。');
   const papers=payload.data.papers?.length??0,journals=payload.data.journals?.length??0,rounds=payload.data.submissions?.length??0;
   if(!await confirmAction('用这份备份恢复数据？',`备份包含 ${papers} 篇论文、${journals} 个期刊、${rounds} 轮投稿。\n恢复会替换当前记录，当前数据会先自动备份；稿件文件不会改变。`,'恢复数据'))return;
   await api('/api/restore','POST',payload);
@@ -340,8 +363,8 @@ document.addEventListener('click',async event=>{
       const name=$('quick-name').value.trim();if(!name)throw new Error('请填写新期刊的名称。');
       const saved=await api('/api/journals','POST',{name,url:$('quick-url').value,notes:''});
       await refresh(false);
-      document.querySelectorAll('.journal-select').forEach(select=>{const value=select.value;select.innerHTML=journalOptions(value);});
-      $('s-journal').value=saved.id;$('quick-name').value='';$('quick-url').value='';button.closest('details').open=false;drawerDirty=true;toast('新期刊已保存并选中');
+      document.querySelectorAll('.journal-select').forEach(select=>{const value=select.value;select.innerHTML=journalOptions(value,select.id==='p-target-journal'?'暂不设置':'请选择期刊');});
+      $(button.dataset.target).value=saved.id;$('quick-name').value='';$('quick-url').value='';button.closest('details').open=false;drawerDirty=true;toast('新期刊已保存并选中');
     }
     else if(action==='delete-paper'){
       if(!await confirmAction('删除这篇论文及全部投稿历史？','删除前会生成本机备份。原稿件文件不会被删除；若只想暂时隐藏，建议改为归档。','删除记录'))return;
