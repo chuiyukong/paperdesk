@@ -143,7 +143,7 @@ textarea{resize:vertical;min-height:115px;line-height:1.8}
 .form-error{background:#fceeee;border:1px solid #e9bebe;color:#943d3d;border-radius:9px;font-size:16px;line-height:1.8;padding:13px 15px;margin-bottom:19px}
 .save-note{font-size:16px;color:#5d7392;margin-left:auto}
 .detail-top{display:flex;gap:13px;align-items:center;margin-bottom:23px;flex-wrap:wrap}.detail-top .button{margin-left:auto}
-.detail-meta{display:grid;grid-template-columns:88px 1fr;gap:14px;font-size:16px;margin-bottom:24px;line-height:1.8}
+.detail-meta{display:grid;grid-template-columns:112px minmax(0,1fr);gap:14px;font-size:16px;margin-bottom:24px;line-height:1.8}
 .detail-meta dt{color:#61718a}.detail-meta dd{margin:0;color:#3f5573;overflow-wrap:anywhere;white-space:pre-wrap}
 .detail-note{font-size:16px;line-height:1.9;color:#5b705b;background:#f2f6ed;border:1px solid #e0e8d5;border-radius:10px;padding:16px;white-space:pre-wrap;overflow-wrap:anywhere}
 .document-row{padding:15px 0;border-bottom:1px solid #e2e9f3;display:flex;align-items:center;justify-content:space-between;gap:14px}
@@ -180,7 +180,7 @@ textarea{resize:vertical;min-height:115px;line-height:1.8}
   .toolbar{padding:15px}.searchbox{min-width:0}.toolbar select{min-width:110px}.panel-title{padding:18px}
   .table-footer{align-items:flex-start;flex-direction:column;gap:9px;padding:15px}
   .drawer-header,.drawer-body{padding-left:20px;padding-right:20px}.drawer-actions{padding:16px 20px}.drawer-header h2{font-size:24px}
-  .form-grid{grid-template-columns:1fr;gap:18px}.save-note{display:none}.detail-meta{grid-template-columns:76px 1fr}
+  .form-grid{grid-template-columns:1fr;gap:18px}.save-note{display:none}.detail-meta{grid-template-columns:104px minmax(0,1fr)}
   .overdue-strip{align-items:flex-start;flex-wrap:wrap}.overdue-strip .link-button{margin-left:0}
   .candidate-row{gap:6px}.candidate-row .icon-button{width:34px;height:40px}.candidate-number{width:15px}
   .backup-section,.journal-card{padding:20px}.backup-row{align-items:flex-start}.empty{padding:34px 18px}
