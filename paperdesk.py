@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_ID = "paperdesk-local-v1"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ROOT = Path(__file__).resolve().parent
 VERSION_PATH = ROOT / "VERSION"
 APP_VERSION = VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.exists() else "1.0.0"
@@ -29,12 +29,13 @@ CHINA = dt.timezone(dt.timedelta(hours=8))
 STAGES = ("planned", "writing", "submitted", "revision", "accepted", "archived")
 STAGE_NAMES = dict(zip(STAGES, ("计划中", "正在写", "已投稿", "退修中", "已录用/发表", "归档")))
 RESULTS = ("accepted", "rejected", "withdrawn", "other")
-TABLES = ("journals", "papers", "files", "submissions", "candidates")
+TABLES = ("journals", "papers", "files", "submissions", "candidates", "settings")
 DOCUMENT_EXTENSIONS = {".doc", ".docx", ".pdf", ".odt", ".rtf", ".txt", ".md", ".tex", ".wps"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS journals (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
- url TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+ url TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+ guidelines_url TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS papers (
  id INTEGER PRIMARY KEY, title TEXT NOT NULL, authors TEXT NOT NULL DEFAULT '',
  tags TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL CHECK(stage IN
@@ -60,7 +61,8 @@ CREATE TABLE IF NOT EXISTS candidates (
  submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
  journal_id INTEGER NOT NULL REFERENCES journals(id), position INTEGER NOT NULL,
  PRIMARY KEY(submission_id,position), UNIQUE(submission_id,journal_id));
-PRAGMA user_version = 2;
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+PRAGMA user_version = 3;
 """
 
 
@@ -106,18 +108,18 @@ def parse_date(value, label):
     return parsed
 
 
-def checked_url(value):
+def checked_url(value, label="投稿链接"):
     if not value:
         return ""
     if any(c.isspace() for c in value):
-        raise ValidationError("投稿链接不能包含空格。")
+        raise ValidationError(f"{label}不能包含空格。")
     try:
         parsed = urlparse(value)
         _ = parsed.port
     except ValueError:
-        raise ValidationError("请填写有效的投稿链接。") from None
+        raise ValidationError(f"请填写有效的{label}。") from None
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
-        raise ValidationError("投稿链接须以 http:// 或 https:// 开头。")
+        raise ValidationError(f"{label}须以 http:// 或 https:// 开头。")
     return value
 
 
@@ -189,16 +191,19 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         try:
-            if version not in (0, 1, SCHEMA_VERSION):
+            if version not in (0, 1, 2, SCHEMA_VERSION):
                 raise ValidationError("数据库版本不兼容，请保留文件并使用对应版本的平台。")
-            if version == 1:
+            if version in (1, 2):
                 self.snapshot("upgrade")
-                self.conn.executescript("""BEGIN IMMEDIATE;
-                    ALTER TABLE papers ADD COLUMN planned_on TEXT;
-                    ALTER TABLE papers ADD COLUMN writing_started_on TEXT;
-                    ALTER TABLE papers ADD COLUMN target_journal_id INTEGER REFERENCES journals(id);
-                    PRAGMA user_version = 2;
-                    COMMIT;""")
+                migration = ["BEGIN IMMEDIATE;"]
+                if version == 1:
+                    migration.extend(("ALTER TABLE papers ADD COLUMN planned_on TEXT;",
+                                      "ALTER TABLE papers ADD COLUMN writing_started_on TEXT;",
+                                      "ALTER TABLE papers ADD COLUMN target_journal_id INTEGER REFERENCES journals(id);"))
+                migration.extend(("ALTER TABLE journals ADD COLUMN guidelines_url TEXT NOT NULL DEFAULT '';",
+                                  "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                                  "PRAGMA user_version = 3;", "COMMIT;"))
+                self.conn.executescript("\n".join(migration))
             self.conn.executescript(SCHEMA)
         except Exception:
             self.conn.rollback()
@@ -212,7 +217,7 @@ class Store:
         return [dict(r) for r in self.conn.execute(query, args).fetchall()]
 
     def require(self, table, record_id):
-        if table not in TABLES:
+        if table not in TABLES or table == "settings":
             raise ValidationError("记录类型无效。")
         record_id = positive_id(record_id)
         row = self.conn.execute(f"SELECT * FROM {table} WHERE id=?", (record_id,)).fetchone()
@@ -258,14 +263,15 @@ class Store:
         name = text_field(data, "name", True, 200)
         url = checked_url(text_field(data, "url", limit=3000))
         notes = text_field(data, "notes")
+        guidelines = checked_url(text_field(data, "guidelines_url", limit=3000), "投稿须知链接") if "guidelines_url" in data else None
         def action():
             if record_id:
-                self.require("journals", record_id)
-                self.conn.execute("UPDATE journals SET name=?,url=?,notes=?,updated_at=? WHERE id=?",
-                                  (name, url, notes, timestamp(), record_id))
+                previous = self.require("journals", record_id)
+                self.conn.execute("UPDATE journals SET name=?,url=?,notes=?,updated_at=?,guidelines_url=? WHERE id=?",
+                                  (name, url, notes, timestamp(), guidelines if guidelines is not None else previous["guidelines_url"], record_id))
                 return record_id
-            return self.conn.execute("INSERT INTO journals(name,url,notes,updated_at) VALUES(?,?,?,?)",
-                                     (name, url, notes, timestamp())).lastrowid
+            return self.conn.execute("INSERT INTO journals(name,url,notes,updated_at,guidelines_url) VALUES(?,?,?,?,?)",
+                                     (name, url, notes, timestamp(), guidelines or "")).lastrowid
         return self.mutate(action)
 
     def journal_delete(self, record_id):
@@ -354,6 +360,8 @@ class Store:
                 # Both records share this transaction; a failed round leaves no partial paper.
                 self._submission_action(record_id, initial)()
                 self.conn.execute("UPDATE papers SET stage=? WHERE id=?", (fields["stage"], record_id))
+            if fields["authors"]:
+                self.conn.execute("INSERT INTO settings(key,value) VALUES('default_authors',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (fields["authors"],))
             return record_id
         return self.mutate(action)
 
@@ -456,6 +464,13 @@ class Store:
                 "SELECT * FROM submissions WHERE paper_id=? ORDER BY submitted_on DESC,id DESC", (record_id,))]
             return paper
 
+    def default_authors(self):
+        row = self.conn.execute("SELECT value FROM settings WHERE key='default_authors'").fetchone()
+        if row:
+            return row[0]
+        row = self.conn.execute("SELECT authors FROM papers WHERE trim(authors)<>'' ORDER BY updated_at DESC,id DESC LIMIT 1").fetchone()
+        return row[0] if row else ""
+
     def state(self):
         with self.lock:
             papers = self.rows("SELECT * FROM papers ORDER BY updated_at DESC,id DESC")
@@ -475,23 +490,32 @@ class Store:
             return {"papers": papers, "journals": journals, "counts": counts,
                     "today": self.day_provider().isoformat(), "overdue_count": sum(p["overdue_days"] > 0 for p in papers),
                     "data_dir": str(self.directory), "database_path": str(self.path),
-                    "backup_dir": str(self.backup_dir), "backups": self.backups(), "app_version": APP_VERSION}
+                    "backup_dir": str(self.backup_dir), "backups": self.backups(), "app_version": APP_VERSION,
+                    "default_authors": self.default_authors()}
 
     def export(self):
         with self.lock:
             return {"app": APP_ID, "app_version": APP_VERSION, "schema_version": SCHEMA_VERSION, "exported_at": timestamp(),
-                    "data": {table: self.rows(f"SELECT * FROM {table} ORDER BY " + ("submission_id,position" if table == "candidates" else "id")) for table in TABLES}}
+                    "data": {table: self.rows(f"SELECT * FROM {table} ORDER BY " + ("submission_id,position" if table == "candidates" else "key" if table == "settings" else "id")) for table in TABLES}}
 
     def validate_export(self, payload):
-        if not isinstance(payload, dict) or payload.get("app") != APP_ID or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, SCHEMA_VERSION):
+        if not isinstance(payload, dict) or payload.get("app") != APP_ID or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, 2, SCHEMA_VERSION):
             raise ValidationError("这不是本平台支持的备份文件。")
         data = payload.get("data")
-        if not isinstance(data, dict) or set(data) != set(TABLES):
+        expected_tables = TABLES if payload["schema_version"] == SCHEMA_VERSION else TABLES[:-1]
+        if not isinstance(data, dict) or set(data) != set(expected_tables):
             raise ValidationError("备份缺少必要的数据表。")
-        for name in TABLES:
+        for name in expected_tables:
             if not isinstance(data[name], list) or len(data[name]) > 100000:
                 raise ValidationError("备份数据格式或大小无效。")
-        data = {name: [dict(row) if isinstance(row, dict) else row for row in data[name]] for name in TABLES}
+        data = {name: [dict(row) if isinstance(row, dict) else row for row in data[name]] for name in expected_tables}
+        data.setdefault("settings", [])
+        setting_keys = set()
+        for row in data["settings"]:
+            if not isinstance(row, dict) or row.get("key") != "default_authors" or row["key"] in setting_keys:
+                raise ValidationError("备份中的作者默认设置无效。")
+            setting_keys.add(row["key"])
+            text_field(row, "value", limit=1000)
         journals = set()
         papers = {}
         rounds = {}
@@ -503,8 +527,11 @@ class Store:
             if ident in journals:
                 raise ValidationError("备份包含重复记录。")
             journals.add(ident)
+            if payload["schema_version"] < 3:
+                row.setdefault("guidelines_url", "")
             text_field(row, "name", True, 200)
             checked_url(text_field(row, "url", limit=3000))
+            checked_url(text_field(row, "guidelines_url", limit=3000), "投稿须知链接")
             text_field(row, "notes")
             text_field(row, "updated_at", True, 100)
         for row in data["papers"]:
@@ -605,6 +632,8 @@ class Store:
     @staticmethod
     def insert_export(connection, data):
         for table in TABLES:
+            if table not in data:
+                continue
             columns = [r[1] for r in connection.execute(f"PRAGMA table_info({table})")]
             query = f"INSERT INTO {table}({','.join(columns)}) VALUES({','.join('?' for _ in columns)})"
             for row in data[table]:
@@ -627,10 +656,10 @@ class Store:
                 connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
                 connection.row_factory = sqlite3.Row
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or version not in (1, SCHEMA_VERSION):
+                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or version not in (1, 2, SCHEMA_VERSION):
                     raise ValidationError("自动备份损坏或版本不兼容。")
                 payload = {"app": APP_ID, "schema_version": version,
-                           "data": {table: [dict(r) for r in connection.execute(f"SELECT * FROM {table}")] for table in TABLES}}
+                           "data": {table: [dict(r) for r in connection.execute(f"SELECT * FROM {table}")] for table in (TABLES if version == SCHEMA_VERSION else TABLES[:-1])}}
             except sqlite3.Error:
                 raise ValidationError("无法读取这份备份，当前数据没有被修改。") from None
             finally:

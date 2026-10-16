@@ -182,6 +182,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.export()["data"], exported["data"])
         before = self.store.export()["data"]
         mutations = [lambda p:p.update(schema_version=999),
+                     lambda p:p["data"]["journals"][0].update(guidelines_url="javascript:alert(1)"),
+                     lambda p:p["data"]["settings"][0].update(value=[]),
                      lambda p:p["data"]["submissions"][0].update(journal_id=999),
                      lambda p:p["data"]["submissions"][0].update(paper_id=[]),
                      lambda p:p["data"]["submissions"][0].update(target_on="2020-01-01"),
@@ -237,6 +239,9 @@ class StoreTests(unittest.TestCase):
         self.store.restore(payload)
         restored = self.store.export()["data"]
         expected = copy.deepcopy(payload["data"])
+        expected["settings"] = []
+        for journal in expected["journals"]:
+            journal["guidelines_url"] = ""
         for paper in expected["papers"]:
             paper.update(planned_on=None, writing_started_on=None, target_journal_id=None)
         self.assertEqual(restored, expected)
@@ -252,7 +257,7 @@ class StoreTests(unittest.TestCase):
             Store.insert_export(old, data)
             old.commit()
         self.store = Store(Path(self.temp.name), lambda: self.day)
-        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
         for paper in self.store.export()["data"]["papers"]:
             paper.pop("planned_on")
             paper.pop("writing_started_on")
@@ -267,6 +272,55 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(restored["planned_on"])
         self.assertIsNone(restored["target_journal_id"])
         self.assertEqual(restored["submissions"][0]["candidates"][0]["name"], "原版候选期刊")
+
+    def test_v2_database_json_and_snapshot_upgrade(self):
+        fixture = Path(__file__).parent / "testdata"
+        data = json.loads((fixture / "v1-backup.json").read_text(encoding="utf-8"))["data"]
+        for paper in data["papers"]:
+            paper.update(planned_on="2024-01-01", writing_started_on="2024-02-01", target_journal_id=self.journal)
+        self.store.close()
+        Path(self.temp.name, "paperdesk.sqlite3").unlink()
+        with closing(sqlite3.connect(Path(self.temp.name, "paperdesk.sqlite3"))) as old:
+            old.executescript((fixture / "v2-schema.sql").read_text(encoding="utf-8"))
+            Store.insert_export(old, data)
+            old.commit()
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        ident = data["papers"][0]["id"]
+        self.assertEqual(self.store.paper_detail(ident)["writing_started_on"], "2024-02-01")
+        self.assertEqual(self.store.state()["default_authors"], "测试作者")
+        snapshot = next(b["name"] for b in self.store.backups() if b["name"].startswith("upgrade-"))
+        self.store.journal_save({"name": "原版测试期刊", "guidelines_url": "https://example.com/authors"}, self.journal)
+        self.store.restore_snapshot(snapshot)
+        self.assertEqual(self.store.require("journals", self.journal)["guidelines_url"], "")
+        self.store.restore({"app": "paperdesk-local-v1", "schema_version": 2, "data": data})
+        self.assertEqual(self.store.paper_detail(ident)["target_journal_id"], self.journal)
+
+    def test_last_authors_persist_independent_of_submission_changes(self):
+        second = self.store.paper_save({"title": "另一篇", "authors": "最近作者", "stage": "writing"})
+        self.store.submission_save(self.paper, self.submission())
+        self.assertEqual(self.store.state()["default_authors"], "最近作者")
+        self.store.paper_save({"title": "另一篇修改", "authors": "修改后的作者", "stage": "writing"}, second)
+        self.assertEqual(self.store.state()["default_authors"], "修改后的作者")
+        payload = self.store.export()
+        self.store.close()
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.state()["default_authors"], "修改后的作者")
+        self.store.paper_save({"title": "空作者", "stage": "writing"})
+        self.store.restore(payload)
+        self.assertEqual(self.store.state()["default_authors"], "修改后的作者")
+
+    def test_journal_guidelines_validation_preservation_and_restore(self):
+        ident = self.store.journal_save({"name": "须知期刊", "guidelines_url": "https://example.com/authors"})
+        self.store.journal_save({"name": "须知期刊改名", "url": "https://example.com/submit"}, ident)
+        self.assertEqual(self.store.require("journals", ident)["guidelines_url"], "https://example.com/authors")
+        before = self.store.export()
+        with self.assertRaisesRegex(ValidationError, "投稿须知链接"):
+            self.store.journal_save({"name": "不能覆盖", "guidelines_url": "ftp://example.com"}, ident)
+        self.assertEqual(self.store.export()["data"], before["data"])
+        self.store.journal_delete(ident)
+        self.store.restore(before)
+        self.assertEqual(self.store.require("journals", ident)["guidelines_url"], "https://example.com/authors")
 
     def test_initial_target_survives_submission_transfer_and_restore(self):
         paper = self.store.paper_save({"title": "目标独立", "stage": "planned", "target_journal_id": self.journal})

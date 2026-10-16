@@ -102,11 +102,14 @@ function renderPaperTable() {
   $('result-count').textContent=`显示 ${papers.length} / ${state.papers.length} 篇论文`;
   if(!papers.length) {
     $('paper-table').innerHTML=state.papers.length ? `<div class="empty compact"><h3>没有符合条件的论文</h3><p>调整筛选条件，或清除搜索内容。</p><button class="button secondary" data-action="clear-filters">清除筛选</button></div>` :
-      `<div class="empty"><div class="empty-icon" aria-hidden="true">▤</div><h3>从第一篇论文开始</h3><p>记录正在写的想法，或已经投出的稿件。<br>投稿历史和转投安排，会一起保留在这里。</p><button class="button primary" data-action="new-paper">＋ 新建论文</button></div>`;
+      `<div class="empty"><div class="empty-icon" aria-hidden="true">▤</div><h3>从第一篇论文开始</h3><p>记录正在写的想法，或已经投出的稿件。<br>投稿记录和转投安排，会一起保留在这里。</p><button class="button primary" data-action="new-paper">＋ 新建论文</button></div>`;
     return;
   }
-  const dateTitle=filters.stage==='planned'?'计划建立日期':filters.stage==='writing'?'开始撰写日期':filters.stage?'投稿日期':'阶段起始日期';
-  const daysTitle=filters.stage==='planned'?'已历时':filters.stage==='writing'?'写作天数':filters.stage?'等待天数':'阶段用时';
+  const shownStages=new Set(papers.map(p=>p.stage));
+  const shownStage=shownStages.size===1?papers[0].stage:filters.stage;
+  const submissionDates=papers.every(p=>!earlyStage(p));
+  const dateTitle=shownStage==='planned'?'计划建立日期':shownStage==='writing'?'开始撰写日期':submissionDates?'投稿日期':'阶段起始日期';
+  const daysTitle=shownStage==='planned'?'已历时':shownStage==='writing'?'写作天数':submissionDates?'等待天数':'阶段用时';
   $('paper-table').innerHTML=`<div class="table-wrap"><table class="papers-table"><thead><tr><th>论文标题</th><th>阶段</th><th>${['planned','writing'].includes(filters.stage)?'初始目标期刊':'期刊'} / 投稿入口</th><th>${dateTitle}</th><th>${daysTitle}</th><th>计划转投</th><th>转投候选期刊</th></tr></thead><tbody>${papers.map(p=>{
     const r=p.current_submission;
     const early=earlyStage(p),j=listedJournal(p),plan=early?null:r;
@@ -114,15 +117,15 @@ function renderPaperTable() {
     const dateLabel=p.stage==='planned'?'计划建立':p.stage==='writing'?'开始撰写':'投稿日期';
     return `<tr><td><button class="paper-title" data-action="paper-detail" data-id="${p.id}">${esc(p.title)}</button><div class="paper-meta">${esc(p.authors||'作者未填写')}${p.tags?` · ${esc(p.tags)}`:''}${p.round_count?`<br>${p.round_count} 轮投稿记录`:''}</div></td>
       <td>${stagePill(p.stage)}</td><td>${j?journalAnchor(j):`<span class="subtle">${early?'未设置目标期刊':'尚未登记投稿'}</span>`}${early?'<div class="paper-meta">初始目标期刊</div>':r?.ended_on?'<div class="paper-meta">上轮 · 已结束</div>':''}</td>
-      <td class="cell-date">${date?esc(date):'<span class="subtle">未设置</span>'}${!filters.stage?`<div class="paper-meta">${dateLabel}</div>`:''}</td><td>${days!=null?`<span class="days">${days}<small>天</small></span><div class="paper-meta">${p.stage==='planned'?'已历时':p.stage==='writing'?'写作天数':r?.ended_on?'该轮总等待':'已等待'}</div>`:'<span class="subtle">—</span>'}</td>
+      <td class="cell-date">${date?esc(date):'<span class="subtle">未设置</span>'}${!shownStage&&!submissionDates?`<div class="paper-meta">${dateLabel}</div>`:''}</td><td>${days!=null?`<span class="days">${days}<small>天</small></span>${early?`<div class="paper-meta">${p.stage==='planned'?'已历时':'写作天数'}</div>`:r?.ended_on?'<div class="paper-meta">该轮总等待</div>':''}`:'<span class="subtle">—</span>'}</td>
       <td class="cell-date">${plan?.target_on?esc(plan.target_on):`<span class="subtle">${early?'—':'未设置'}</span>`}${p.overdue_days?`<br><span class="overdue-badge">超过计划时间 ${p.overdue_days} 天</span>`:''}${plan?.ended_on&&plan.target_on?'<div class="paper-meta">上轮计划</div>':''}</td>
-      <td>${plan?.candidates?.length?journalAnchor(plan.candidates[0]):'<span class="subtle">—</span>'}${plan?.candidates?.length>1?`<div class="paper-meta">另有 ${plan.candidates.length-1} 个候选</div>`:''}</td></tr>`;
+      <td>${plan?.candidates?.length?`<span class="journal-name">${esc(plan.candidates[0].name)}</span>`:'<span class="subtle">—</span>'}${plan?.candidates?.length>1?`<div class="paper-meta">另有 ${plan.candidates.length-1} 个候选</div>`:''}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
 function renderJournals() {
   $('content').innerHTML=header('期刊管理','保存常用期刊，一次设置投稿入口。',`<button class="button primary" data-action="new-journal">＋ 新增期刊</button>`)+
-    (state.journals.length?`<div class="journal-grid">${state.journals.map(j=>`<article class="journal-card"><h2>${esc(j.name)}</h2>${j.url?`<a class="journal-url" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer" title="${esc(j.url)}">${esc(j.url)}</a>`:'<span class="journal-url subtle">尚未设置投稿入口</span>'}<p>${esc(j.notes||'暂无备注')}</p><div class="card-actions"><small>${j.usage_count} 轮投稿记录</small><div>${j.url?`<a class="button secondary small" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer">投稿入口 ↗</a> `:''}<button class="button secondary small" data-action="edit-journal" data-id="${j.id}">编辑</button></div></div></article>`).join('')}</div>`:
+    (state.journals.length?`<div class="journal-grid">${state.journals.map(j=>`<article class="journal-card"><h2>${esc(j.name)}</h2>${j.url?`<a class="journal-url" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer" title="${esc(j.url)}">${esc(j.url)}</a>`:'<span class="journal-url subtle">尚未设置投稿入口</span>'}<p>${esc(j.notes||'暂无备注')}</p><div class="journal-guidelines"><b>投稿须知</b>${j.guidelines_url?`<a class="button secondary small" href="${esc(j.guidelines_url)}" target="_blank" rel="noopener noreferrer">查看投稿须知 ↗</a>`:`<button class="link-button" data-action="edit-journal" data-id="${j.id}">添加投稿须知链接</button>`}</div><div class="card-actions"><small>${j.usage_count} 轮投稿记录</small><div>${j.url?`<a class="button secondary small" href="${esc(j.url)}" target="_blank" rel="noopener noreferrer">投稿入口 ↗</a> `:''}<button class="button secondary small" data-action="edit-journal" data-id="${j.id}">编辑期刊</button></div></div></article>`).join('')}</div>`:
     `<div class="panel empty"><div class="empty-icon" aria-hidden="true">▥</div><h3>保存你的常用期刊</h3><p>填写期刊名称与投稿管理页链接。<br>之后登记投稿时，可以直接选择。</p><button class="button primary" data-action="new-journal">＋ 新增期刊</button></div>`);
 }
 
@@ -150,7 +153,7 @@ function showDrawer(html, info) {
   drawerDirty=false;
   document.body.classList.add('drawer-open');
   $('drawer').focus();
-  $('drawer').querySelectorAll('input,textarea,select').forEach(el=>el.addEventListener('input',()=>{drawerDirty=true;}));
+  $('drawer').oninput=()=>{drawerDirty=true;const error=$('form-error');if(error&&!error.hidden){error.hidden=true;error.textContent='';}};
 }
 async function allowNavigation() {
   if(saving){toast('正在保存，请稍等片刻。');return false;}
@@ -183,21 +186,23 @@ async function paperDetail(id, expectedGeneration=null) {
     <div class="section-heading">论文文件${p.folder?`<button class="link-button" data-action="open-folder" data-id="${p.id}">打开文件夹 ↗</button>`:''}</div>
     ${p.folder?`<div class="path-block">${esc(p.folder)}</div>`:''}
     ${p.files.length?p.files.map(f=>`<div class="document-row"><div><b>${esc(f.label)}</b><small>${esc(f.path)}</small></div><button class="button secondary small" data-action="open-file" data-id="${f.id}">打开 ↗</button></div>`).join(''):'<p class="field-help">尚未关联稿件，可在“编辑论文信息”中添加。</p>'}
-    <div class="section-heading">投稿历史<button class="link-button" data-action="new-submission" data-id="${p.id}">＋ ${active?'补录历史':'登记投稿'}</button></div>
-    ${p.submissions.length?p.submissions.map(r=>`<article class="history-card ${!r.ended_on?'active-round':''}"><div class="history-heading"><b>${esc(r.journal_name)}</b><small>${r.ended_on?esc(results[r.result]):'进行中'}</small></div><div class="history-dates">投稿 ${esc(r.submitted_on)}${r.ended_on?` · 结束 ${esc(r.ended_on)}`:''}<br>${r.ended_on?'该轮总等待':'已等待'} ${r.elapsed_days} 天${r.manuscript_number?` · 稿件编号 ${esc(r.manuscript_number)}`:''}</div>${r.progress?`<div class="history-note">进展：${esc(r.progress)}</div>`:''}${r.notes?`<div class="history-note">${esc(r.notes)}</div>`:''}<div class="history-plan">${r.target_on?`计划转投：${esc(r.target_on)}${r.transfer_mode==='days'?`（投稿后 ${r.wait_days} 天）`:''}`:'未设置转投日期'}${r.candidates.length?`<br>候选：${r.candidates.map(j=>esc(j.name)).join(' → ')}`:''}</div>${r.overdue_days?`<span class="overdue-badge">超过计划时间 ${r.overdue_days} 天</span>`:''}<div class="history-actions">${r.journal_url?`<a class="link-button" href="${esc(r.journal_url)}" target="_blank" rel="noopener noreferrer">投稿入口 ↗</a>`:`<button class="link-button" data-action="edit-journal" data-id="${r.journal_id}">设置投稿入口</button>`}<button class="link-button" data-action="edit-submission" data-paper="${p.id}" data-id="${r.id}">编辑记录</button>${!r.ended_on?`<button class="link-button" data-action="end-submission" data-paper="${p.id}" data-id="${r.id}">结束本轮</button>`:''}</div></article>`).join(''):'<div class="empty compact"><h3>还没有投稿记录</h3><p>投稿后登记期刊和日期，即可开始计时。</p><button class="button primary" data-action="new-submission" data-id="'+p.id+'">＋ 登记投稿</button></div>'}
-    </div><div class="drawer-actions"><button class="button secondary" data-action="close-drawer">关闭</button>${!active?`<button class="button primary push-right" data-action="new-submission" data-id="${p.id}">＋ 登记投稿</button>`:`<button class="button primary push-right" data-action="edit-submission" data-paper="${p.id}" data-id="${active.id}">更新当前投稿</button>`}</div>`,{kind:'detail',paperId:p.id,paper:p});
+    <div class="section-heading">投稿记录</div>
+    ${p.submissions.length?p.submissions.map(r=>`<article class="history-card ${!r.ended_on?'active-round':''}"><div class="history-heading"><b>${esc(r.journal_name)}</b><small>${r.ended_on?esc(results[r.result]):'进行中'}</small></div><div class="history-dates">投稿 ${esc(r.submitted_on)}${r.ended_on?` · 结束 ${esc(r.ended_on)}`:''}<br>${r.ended_on?'该轮总等待 ':''}${r.elapsed_days} 天${r.manuscript_number?` · 稿件编号 ${esc(r.manuscript_number)}`:''}</div>${r.progress?`<div class="history-note">进展：${esc(r.progress)}</div>`:''}${r.notes?`<div class="history-note">${esc(r.notes)}</div>`:''}<div class="history-plan">${r.target_on?`计划转投：${esc(r.target_on)}${r.transfer_mode==='days'?`（投稿后 ${r.wait_days} 天）`:''}`:'未设置转投日期'}${r.candidates.length?`<br>候选：${r.candidates.map(j=>esc(j.name)).join(' → ')}`:''}</div>${r.overdue_days?`<span class="overdue-badge">超过计划时间 ${r.overdue_days} 天</span>`:''}<div class="history-actions">${r.journal_url?`<a class="link-button" href="${esc(r.journal_url)}" target="_blank" rel="noopener noreferrer">投稿入口 ↗</a>`:`<button class="link-button" data-action="edit-journal" data-id="${r.journal_id}">设置投稿入口</button>`}${r.ended_on?`<button class="link-button" data-action="edit-submission" data-paper="${p.id}" data-id="${r.id}">编辑本轮记录</button>`:''}</div></article>`).join(''):'<div class="empty compact"><h3>还没有投稿记录</h3><p>点击下方“登记投稿”，填写期刊和日期即可开始计时。</p></div>'}
+    ${active?`<details class="record-tools"><summary>补充旧投稿记录</summary><p class="field-help">用于补录此前已经结束的轮次，当前投稿继续保留。</p><button class="button secondary" data-action="new-submission" data-id="${p.id}">补录已结束轮次</button></details>`:''}
+    </div><div class="drawer-actions"><button class="button secondary" data-action="close-drawer">关闭</button>${!active?`<button class="button primary push-right" data-action="new-submission" data-id="${p.id}">登记投稿</button>`:`<button class="button primary push-right" data-action="edit-submission" data-paper="${p.id}" data-id="${active.id}">管理当前投稿</button>`}</div>`,{kind:'detail',paperId:p.id,paper:p});
 }
 
 function fileEditRow(f={}) {return `<div class="file-edit-row" data-file-row><div class="file-row-top"><input class="file-label" placeholder="稿件名称，例如投稿终稿" aria-label="稿件名称" value="${esc(f.label||'')}" maxlength="200"><button class="icon-button" type="button" data-action="remove-file-row" aria-label="移除稿件关联">×</button></div><div class="inline-input"><input class="file-path" required placeholder="稿件完整路径" aria-label="稿件路径" value="${esc(f.path||'')}" maxlength="4000"><button class="button secondary small" type="button" data-action="pick-file">选择文件</button></div></div>`;}
 async function paperForm(id) {
-  const p=id?await api(`/api/papers/${id}`):{title:'',authors:'',tags:'',stage:'writing',notes:'',folder:'',planned_on:null,writing_started_on:state.today,target_journal_id:null,files:[],submissions:[]};
+  const stage=filters.stage||'writing';
+  const p=id?await api(`/api/papers/${id}`):{title:'',authors:state.default_authors||'',tags:'',stage,notes:'',folder:'',planned_on:stage==='planned'?state.today:null,writing_started_on:stage==='writing'?state.today:null,target_journal_id:null,files:[],submissions:[]};
   const active=p.submissions.some(r=>!r.ended_on);
   const allowed=!id?Object.keys(stages):active?['submitted','revision','archived']:['planned','writing','accepted','archived'];
   showDrawer(drawerHeader(id?'编辑论文':'新建论文',id?'论文信息':'从一篇论文开始')+`<div class="drawer-body"><form id="paper-form"><div id="form-error" class="form-error" hidden></div>
     <div class="form-field"><label for="p-title">论文标题 <span class="required">*</span></label><input id="p-title" required maxlength="500" placeholder="填写论文标题" value="${esc(p.title)}"></div>
     <div class="form-grid"><div class="form-field"><label for="p-authors">作者</label><input id="p-authors" maxlength="1000" placeholder="作者姓名" value="${esc(p.authors)}"></div><div class="form-field"><label for="p-stage">论文阶段</label><select id="p-stage">${Object.entries(stages).map(([k,v])=>`<option value="${k}" ${p.stage===k?'selected':''} ${!allowed.includes(k)?'disabled':''}>${v}</option>`).join('')}</select></div></div>
-    <p id="p-stage-help" class="field-help">${active?'当前有进行中的投稿。录用或退稿时，请在投稿历史中“结束本轮”。':id?'登记投稿后，阶段会自动变为“已投稿”。':'之前已经投稿的论文，可以直接选择“已投稿”或“退修中”，填写原投稿信息。'}</p>
-    ${!id?`<section id="p-initial-submission" class="initial-submission" hidden><div class="section-heading">当前投稿</div><div class="form-field"><label for="p-submission-journal">投稿期刊 <span class="required">*</span></label><select id="p-submission-journal" class="journal-select">${journalOptions()}</select><small>没有找到期刊？可在下方快速新增。</small></div><div class="form-grid"><div class="form-field"><label for="p-submitted-on">原投稿日期 <span class="required">*</span></label><input id="p-submitted-on" type="date" max="${state.today}" value="${state.today}"></div><div class="form-field"><label for="p-manuscript-number">稿件编号</label><input id="p-manuscript-number" maxlength="200" placeholder="选填"></div></div><div class="form-field"><label for="p-submission-progress">当前进展</label><input id="p-submission-progress" maxlength="1000" placeholder="例如：外审中、已收到修改意见"></div><p class="field-help">按原投稿日期计算等待天数。保存后可在投稿历史中设置转投计划、补录更早的轮次。</p></section>`:''}
+    <p id="p-stage-help" class="field-help">${active?'当前有进行中的投稿。录用或退稿时，请通过“管理当前投稿”将本轮状态设为“已结束”。':id?'登记投稿后，阶段会自动变为“已投稿”。':'之前已经投稿的论文，可以直接选择“已投稿”或“退修中”，填写原投稿信息。'}</p>
+    ${!id?`<section id="p-initial-submission" class="initial-submission" hidden><div class="section-heading">当前投稿</div><div class="form-field"><label for="p-submission-journal">投稿期刊 <span class="required">*</span></label><select id="p-submission-journal" class="journal-select">${journalOptions()}</select><small>没有找到期刊？可在下方快速新增。</small></div><div class="form-grid"><div class="form-field"><label for="p-submitted-on">原投稿日期 <span class="required">*</span></label><input id="p-submitted-on" type="date" max="${state.today}" value="${state.today}"></div><div class="form-field"><label for="p-manuscript-number">稿件编号</label><input id="p-manuscript-number" maxlength="200" placeholder="选填"></div></div><div class="form-field"><label for="p-submission-progress">当前进展</label><input id="p-submission-progress" maxlength="1000" placeholder="例如：外审中、已收到修改意见"></div><p class="field-help">按原投稿日期计算等待天数。保存后可在投稿记录中设置转投计划、补录更早的轮次。</p></section>`:''}
     <div id="p-target-field" class="form-field"><label for="p-target-journal">初始目标期刊</label><select id="p-target-journal" class="journal-select">${journalOptions(p.target_journal_id,'暂不设置')}</select><small>最初计划投稿的期刊，独立于每轮投稿和转投候选，可随时修改。</small></div>
     ${quickJournalForm('p-target-journal')}
     <div id="p-stage-dates"><div class="form-grid"><div class="form-field"><label for="p-planned-on">计划建立日期</label><input id="p-planned-on" type="date" max="${state.today}" value="${esc(p.planned_on||'')}"></div><div class="form-field"><label for="p-writing-on">开始撰写日期</label><input id="p-writing-on" type="date" max="${state.today}" value="${esc(p.writing_started_on||'')}"></div></div><p class="field-help">从对应日期开始计时，当天为第 0 天；可以补填或留空。</p></div>
@@ -249,13 +254,13 @@ async function savePaper(event) {
 }
 
 function journalForm(id) {
-  const j=id?state.journals.find(j=>j.id===id):{name:'',url:'',notes:''};
+  const j=id?state.journals.find(j=>j.id===id):{name:'',url:'',notes:'',guidelines_url:''};
   if(!j)throw new Error('期刊不存在，请刷新页面。');
   const returnPaper=drawerInfo?.paperId;
-  showDrawer(drawerHeader(id?'编辑期刊':'新增期刊','投稿入口')+`<div class="drawer-body"><form id="journal-form"><div id="form-error" class="form-error" hidden></div><div class="form-field"><label for="j-name">期刊名称 <span class="required">*</span></label><input id="j-name" required maxlength="200" placeholder="填写期刊名称" value="${esc(j.name)}"></div><div class="form-field"><label for="j-url">投稿管理页链接</label><input id="j-url" type="url" maxlength="3000" placeholder="https://…" value="${esc(j.url)}"><small>填写你平时登录的投稿系统入口；打开后仍由你正常登录。</small></div><div class="form-field"><label for="j-notes">备注</label><textarea id="j-notes" maxlength="10000" placeholder="期刊方向、投稿要求或自己的记录…">${esc(j.notes)}</textarea></div>${id?`<button class="button danger small" type="button" data-action="delete-journal" data-id="${id}">删除期刊</button><p class="field-help">已用于投稿或候选计划的期刊，需先修改相关记录才能删除。</p>`:''}</form></div>`+formActions('journal-form'),{kind:'journal-form',journalId:id||null,paperId:returnPaper});
+  showDrawer(drawerHeader(id?'编辑期刊':'新增期刊','投稿入口与须知')+`<div class="drawer-body"><form id="journal-form"><div id="form-error" class="form-error" hidden></div><div class="form-field"><label for="j-name">期刊名称 <span class="required">*</span></label><input id="j-name" required maxlength="200" placeholder="填写期刊名称" value="${esc(j.name)}"></div><div class="form-field"><label for="j-url">投稿管理页链接</label><input id="j-url" type="url" maxlength="3000" placeholder="https://…" value="${esc(j.url)}"><small>填写你平时登录的投稿系统入口；打开后仍由你正常登录。</small></div><div class="form-field"><label for="j-guidelines">投稿须知链接</label><input id="j-guidelines" type="url" maxlength="3000" placeholder="https://…" value="${esc(j.guidelines_url||'')}"><small>填写期刊的投稿说明、征稿要求或作者指南页面。</small></div><div class="form-field"><label for="j-notes">备注</label><textarea id="j-notes" maxlength="10000" placeholder="期刊方向、投稿要求或自己的记录…">${esc(j.notes)}</textarea></div>${id?`<button class="button danger small" type="button" data-action="delete-journal" data-id="${id}">删除期刊</button><p class="field-help">已用于投稿或候选计划的期刊，需先修改相关记录才能删除。</p>`:''}</form></div>`+formActions('journal-form'),{kind:'journal-form',journalId:id||null,paperId:returnPaper});
   $('journal-form').addEventListener('submit',async e=>{
     e.preventDefault();saving=true;const button=document.querySelector('[form="journal-form"]');button.disabled=true;
-    try{await api(id?`/api/journals/${id}`:'/api/journals',id?'PUT':'POST',{name:$('j-name').value,url:$('j-url').value,notes:$('j-notes').value});drawerDirty=false;await refresh();if(returnPaper)await paperDetail(returnPaper);else await closeDrawer(true);toast('期刊已保存');}
+    try{await api(id?`/api/journals/${id}`:'/api/journals',id?'PUT':'POST',{name:$('j-name').value,url:$('j-url').value,guidelines_url:$('j-guidelines').value,notes:$('j-notes').value});drawerDirty=false;await refresh();if(returnPaper)await paperDetail(returnPaper);else await closeDrawer(true);toast('期刊已保存');}
     catch(error){formError(error);}finally{saving=false;if(button.isConnected)button.disabled=false;}
   });
 }
@@ -272,7 +277,7 @@ async function submissionForm(paperId,roundId,end=false) {
   if(!r)throw new Error('投稿记录不存在，请刷新页面。');
   const historyOnly=!roundId&&!!active;
   const closed=!!r.ended_on||end||historyOnly;
-  showDrawer(drawerHeader(end?'结束本轮投稿':roundId?'编辑投稿记录':historyOnly?'补录投稿历史':'登记投稿',p.title)+`<div class="drawer-body"><form id="submission-form"><div id="form-error" class="form-error" hidden></div>
+  showDrawer(drawerHeader(end?'结束本轮投稿':roundId?(r.ended_on?'编辑本轮记录':'管理当前投稿'):historyOnly?'补录已结束轮次':'登记投稿',p.title)+`<div class="drawer-body"><form id="submission-form"><div id="form-error" class="form-error" hidden></div>
     ${historyOnly?'<div class="mini-banner">这篇论文已有进行中的投稿。这里可补录已结束的历史；转投前请先结束当前轮次。</div>':''}
     <div class="form-field"><label for="s-journal">投稿期刊 <span class="required">*</span></label><select id="s-journal" class="journal-select" required>${journalOptions(r.journal_id)}</select><small>没有找到期刊？可在下方直接新增。</small></div>
     ${quickJournalForm('s-journal')}
@@ -332,7 +337,7 @@ $('modal-cancel').addEventListener('click',()=>resolveModal(false));
 $('modal-ok').addEventListener('click',()=>resolveModal(true));
 
 async function restorePayload(payload) {
-  if(payload?.app!=='paperdesk-local-v1'||![1,2].includes(payload.schema_version)||!payload.data)throw new Error('请选择本平台导出的完整 JSON 备份。');
+  if(payload?.app!=='paperdesk-local-v1'||![1,2,3].includes(payload.schema_version)||!payload.data)throw new Error('请选择本平台导出的完整 JSON 备份。');
   const papers=payload.data.papers?.length??0,journals=payload.data.journals?.length??0,rounds=payload.data.submissions?.length??0;
   if(!await confirmAction('用这份备份恢复数据？',`备份包含 ${papers} 篇论文、${journals} 个期刊、${rounds} 轮投稿。\n恢复会替换当前记录，当前数据会先自动备份；稿件文件不会改变。`,'恢复数据'))return;
   await api('/api/restore','POST',payload);
@@ -383,7 +388,7 @@ document.addEventListener('click',async event=>{
       $(button.dataset.target).value=saved.id;$('quick-name').value='';$('quick-url').value='';button.closest('details').open=false;drawerDirty=true;toast('新期刊已保存并选中');
     }
     else if(action==='delete-paper'){
-      if(!await confirmAction('删除这篇论文及全部投稿历史？','删除前会生成本机备份。原稿件文件不会被删除；若只想暂时隐藏，建议改为归档。','删除记录'))return;
+      if(!await confirmAction('删除这篇论文及全部投稿记录？','删除前会生成本机备份。原稿件文件不会被删除；若只想暂时隐藏，建议改为归档。','删除记录'))return;
       await api(`/api/papers/${id}`,'DELETE',{});await closeDrawer(true);await refresh();toast('论文记录已删除');
     }
     else if(action==='delete-journal'){
@@ -391,7 +396,7 @@ document.addEventListener('click',async event=>{
       const returnPaper=drawerInfo?.paperId;await api(`/api/journals/${id}`,'DELETE',{});await refresh();if(returnPaper)await paperDetail(returnPaper);else await closeDrawer(true);toast('期刊已删除');
     }
     else if(action==='delete-submission'){
-      if(!await confirmAction('删除这轮投稿记录？','删除前会生成本机备份。如果是退稿、撤稿或录用，建议使用“结束本轮”保留历史。','删除记录'))return;
+      if(!await confirmAction('删除这轮投稿记录？','删除前会生成本机备份。如果是退稿、撤稿或录用，建议通过“管理当前投稿”将本轮设为“已结束”，以保留记录。','删除记录'))return;
       await api(`/api/submissions/${id}`,'DELETE',{});drawerDirty=false;await refresh();await paperDetail(Number(button.dataset.paper));toast('这轮投稿记录已删除');
     }
     else if(action==='export'){
