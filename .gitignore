@@ -7,6 +7,7 @@ __pycache__/
 instance.json
 backups/
 dist/
+output/
 migration/
 migration-report.json
 .env

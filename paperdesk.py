@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import socket
@@ -17,12 +18,15 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_ID = "paperdesk-local-v1"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMAS = (1, 2, 3, 4)
+MAX_JSON_BYTES = 20 * 1024 * 1024
 ROOT = Path(__file__).resolve().parent
 VERSION_PATH = ROOT / "VERSION"
 APP_VERSION = VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.exists() else "1.0.0"
@@ -39,7 +43,7 @@ CREATE TABLE IF NOT EXISTS journals (
  url TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
  guidelines_url TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS papers (
- id INTEGER PRIMARY KEY, title TEXT NOT NULL, authors TEXT NOT NULL DEFAULT '',
+ id INTEGER PRIMARY KEY, paper_code TEXT NOT NULL, title TEXT NOT NULL, authors TEXT NOT NULL DEFAULT '',
  tags TEXT NOT NULL DEFAULT '', stage TEXT NOT NULL CHECK(stage IN
  ('planned','writing','submitted','revision','accepted','archived')),
  notes TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT '',
@@ -64,12 +68,61 @@ CREATE TABLE IF NOT EXISTS candidates (
  journal_id INTEGER NOT NULL REFERENCES journals(id), position INTEGER NOT NULL,
  PRIMARY KEY(submission_id,position), UNIQUE(submission_id,journal_id));
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-PRAGMA user_version = 3;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_paper_code ON papers(paper_code);
+CREATE TABLE IF NOT EXISTS operation_receipts (
+ operation_key TEXT PRIMARY KEY, kind TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ result_json TEXT NOT NULL, created_at TEXT NOT NULL);
+PRAGMA user_version = 4;
 """
 
 
 class ValidationError(Exception):
     pass
+
+
+class ConflictError(ValidationError):
+    pass
+
+
+class InvalidDatabase(ValidationError):
+    pass
+
+
+class UnsupportedSchema(ValidationError):
+    pass
+
+
+def paper_code(value):
+    if not isinstance(value, str):
+        raise ValidationError("请填写稿件编号。")
+    code = unicodedata.normalize("NFKC", value).strip().upper()
+    if not code or len(code) > 64 or any(c.isspace() or ord(c) < 32 for c in code):
+        raise ValidationError("稿件编号不能为空、不能含空格，最长 64 个字符。")
+    return code
+
+
+def numbered_codes(papers):
+    """Stable identifiers for legacy records; never infer IDs from a journal's code."""
+    for index, row in enumerate(sorted(papers, key=lambda r: r["id"]), 1):
+        row["paper_code"] = f"{index:04d}"
+
+
+def snapshot_info(path):
+    connection = None
+    try:
+        connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        connection.execute("BEGIN")
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in SUPPORTED_SCHEMAS or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise ValidationError("备份结构或完整性无效。")
+        if connection.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValidationError("备份中的关联不完整。")
+        return {name: connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                for name in ("papers", "journals", "submissions", "files")}
+    except sqlite3.Error:
+        raise ValidationError("这份数据库无法读取，原文件已保留。") from None
+    finally:
+        if connection:
+            connection.close()
 
 
 def today() -> dt.date:
@@ -187,11 +240,13 @@ def read_snapshot(path):
         connection.row_factory = sqlite3.Row
         connection.execute("BEGIN")
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (1, 2, SCHEMA_VERSION) or connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        if version > SCHEMA_VERSION:
+            raise UnsupportedSchema("这份数据由更高版本的平台创建，请使用对应的新版本；原文件没有被修改。")
+        if version not in SUPPORTED_SCHEMAS or connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValidationError("数据库或备份损坏，或版本不兼容；原文件已保留。")
         if connection.execute("PRAGMA foreign_key_check").fetchone():
             raise ValidationError("数据库的记录关联不完整；原文件已保留。")
-        tables = TABLES if version == SCHEMA_VERSION else TABLES[:-1]
+        tables = TABLES if version >= 3 else TABLES[:-1]
         return {"app": APP_ID, "schema_version": version,
                 "data": {table: [dict(r) for r in connection.execute(f"SELECT * FROM {table}")] for table in tables}}
     except sqlite3.Error:
@@ -216,27 +271,47 @@ class Store:
         self.backup_dir = self.directory / "backups"
         self.backup_dir.mkdir(exist_ok=True)
         self.path = self.directory / "paperdesk.sqlite3"
+        if self.path.exists():
+            try:
+                read_snapshot(self.path)
+            except UnsupportedSchema:
+                raise
+            except (ValidationError, OSError) as exc:
+                raise InvalidDatabase(f"本机数据库为空文件、损坏或结构不完整，已停止启动，原文件没有被覆盖。\n数据位置：{self.path}\n可选择有效的备份恢复。") from exc
         self.lock = threading.RLock()
         self.day_provider = day_provider
+        self._backup_cache = {}
+        self._in_mutation = False
+        self.backup_warning = None
         self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         try:
-            if version not in (0, 1, 2, SCHEMA_VERSION):
+            if version not in (0, *SUPPORTED_SCHEMAS):
                 raise ValidationError("数据库版本不兼容，请保留文件并使用对应版本的平台。")
-            if version in (1, 2):
+            if version in (1, 2, 3):
                 self.snapshot("upgrade")
                 migration = ["BEGIN IMMEDIATE;"]
                 if version == 1:
                     migration.extend(("ALTER TABLE papers ADD COLUMN planned_on TEXT;",
                                       "ALTER TABLE papers ADD COLUMN writing_started_on TEXT;",
                                       "ALTER TABLE papers ADD COLUMN target_journal_id INTEGER REFERENCES journals(id);"))
-                migration.extend(("ALTER TABLE journals ADD COLUMN guidelines_url TEXT NOT NULL DEFAULT '';",
-                                  "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-                                  "PRAGMA user_version = 3;", "COMMIT;"))
+                if version in (1, 2):
+                    migration.extend(("ALTER TABLE journals ADD COLUMN guidelines_url TEXT NOT NULL DEFAULT '';",
+                                      "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"))
+                migration.append("ALTER TABLE papers ADD COLUMN paper_code TEXT NOT NULL DEFAULT '';")
+                for index, row in enumerate(self.conn.execute("SELECT id FROM papers ORDER BY id"), 1):
+                    migration.append(f"UPDATE papers SET paper_code='{index:04d}' WHERE id={int(row[0])};")
+                migration.extend(("PRAGMA user_version = 4;", "COMMIT;"))
                 self.conn.executescript("\n".join(migration))
             self.conn.executescript(SCHEMA)
+            if version:
+                try:
+                    self.snapshot("latest")
+                except (OSError, sqlite3.Error, ValidationError):
+                    logging.exception("Database opened; latest backup failed")
+                    self.backup_warning = "记录可读取，但最新完整备份未更新。请在数据与备份中重试。"
         except Exception:
             self.conn.rollback()
             self.conn.close()
@@ -259,10 +334,14 @@ class Store:
 
     def snapshot(self, reason="daily"):
         day = self.day_provider().isoformat()
-        name = f"daily-{day}.sqlite3" if reason == "daily" else f"{reason}-{day}-{time.time_ns()}.sqlite3"
+        name = f"{reason}-{day}.sqlite3" if reason in ("daily", "latest") else f"{reason}-{day}-{time.time_ns()}.sqlite3"
         dest = self.backup_dir / name
-        if dest.exists():
-            return
+        if dest.exists() and reason != "latest":
+            try:
+                snapshot_info(dest)
+                return
+            except ValidationError:
+                dest.replace(self.backup_dir / f"damaged-{day}-{time.time_ns()}.sqlite3")
         temporary = dest.with_suffix(".tmp")
         try:
             backup = sqlite3.connect(temporary)
@@ -271,6 +350,7 @@ class Store:
             finally:
                 backup.close()
             temporary.replace(dest)
+            self._backup_cache.pop(name, None)
         finally:
             temporary.unlink(missing_ok=True)
         cutoff = self.day_provider() - dt.timedelta(days=29)
@@ -284,12 +364,66 @@ class Store:
 
     def mutate(self, action, reason="daily"):
         with self.lock:
+            if self._in_mutation:
+                return action()
             self.snapshot(reason)
             try:
                 with self.conn:
-                    return action()
+                    self._in_mutation = True
+                    result = action()
             except sqlite3.IntegrityError:
                 raise ValidationError("记录发生冲突：请检查期刊是否重名，或这篇论文是否已有进行中的投稿。") from None
+            finally:
+                self._in_mutation = False
+            try:
+                self.snapshot("latest")
+                self.backup_warning = None
+            except (OSError, sqlite3.Error, ValidationError):
+                logging.exception("Records committed; latest backup failed")
+                self.backup_warning = "记录已保存，最新备份未更新。请在数据与备份中重试备份。"
+            return result
+
+    def check_revision(self, previous, data, key="expected_updated_at"):
+        expected = data.get(key)
+        if expected is not None and expected != previous["updated_at"]:
+            raise ConflictError("这条记录已在另一页面更新，你填写的内容仍保留在当前表单。请核对后重新读取记录。")
+
+    def once(self, key, kind, payload, action):
+        if not key:
+            return action()
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", key):
+            raise ValidationError("保存标识无效，请刷新页面重试。")
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        with self.lock:
+            previous = self.conn.execute("SELECT kind,payload_hash,result_json FROM operation_receipts WHERE operation_key=?", (key,)).fetchone()
+            if previous:
+                if previous[0] != kind or previous[1] != digest:
+                    raise ConflictError("这次操作已保存，请重新读取记录后再修改；更改内容尚未保存。")
+                return json.loads(previous[2])
+            def save_once():
+                result = action()
+                self.conn.execute("INSERT INTO operation_receipts VALUES(?,?,?,?,?)", (key, kind, digest, json.dumps(result, ensure_ascii=False), timestamp()))
+                self.conn.execute("DELETE FROM operation_receipts WHERE operation_key NOT IN (SELECT operation_key FROM operation_receipts ORDER BY created_at DESC LIMIT 2000)")
+                return result
+            reason = "delete" if kind.startswith("DELETE:") else "restore" if kind.endswith(("/api/restore", "/api/backups/restore")) else "daily"
+            return self.mutate(save_once, reason)
+
+    def next_paper_code(self):
+        rows = self.rows("SELECT paper_code FROM papers ORDER BY id DESC")
+        existing = {r["paper_code"] for r in rows}
+        last = rows[0]["paper_code"] if rows else "0000"
+        match = re.fullmatch(r"(.*?)([0-9]+)", last)
+        prefix, width = (match[1], len(match[2])) if match else ("", 4)
+        suffixes = [int(r[len(prefix):]) for r in existing if r.startswith(prefix) and re.fullmatch(r"[0-9]+", r[len(prefix):])]
+        number = max(suffixes, default=0) + 1
+        while (candidate := f"{prefix}{number:0{width}d}") in existing:
+            number += 1
+        if len(candidate) > 64:
+            number = max((int(c) for c in existing if c.isascii() and c.isdigit()), default=0) + 1
+            candidate = f"{number:04d}"
+            if len(candidate) > 64:
+                candidate = next(f"P{i:04d}" for i in range(1, len(existing) + 2) if f"P{i:04d}" not in existing)
+        return candidate
 
     def journal_save(self, data, record_id=None):
         name = text_field(data, "name", True, 200)
@@ -299,6 +433,7 @@ class Store:
         def action():
             if record_id:
                 previous = self.require("journals", record_id)
+                self.check_revision(previous, data)
                 self.conn.execute("UPDATE journals SET name=?,url=?,notes=?,updated_at=?,guidelines_url=? WHERE id=?",
                                   (name, url, notes, timestamp(), guidelines if guidelines is not None else previous["guidelines_url"], record_id))
                 return record_id
@@ -306,9 +441,9 @@ class Store:
                                      (name, url, notes, timestamp(), guidelines or "")).lastrowid
         return self.mutate(action)
 
-    def journal_delete(self, record_id):
+    def journal_delete(self, record_id, data=None):
         def action():
-            self.require("journals", record_id)
+            self.check_revision(self.require("journals", record_id), data or {})
             if self.conn.execute("SELECT 1 FROM submissions WHERE journal_id=? UNION SELECT 1 FROM candidates WHERE journal_id=? UNION SELECT 1 FROM papers WHERE target_journal_id=?",
                                  (record_id, record_id, record_id)).fetchone():
                 raise ValidationError("这个期刊已用于初始目标、投稿或转投计划，请先修改相关记录。")
@@ -359,7 +494,11 @@ class Store:
             previous = None
             if record_id:
                 previous = self.require("papers", record_id)
+                self.check_revision(previous, data)
                 active = self.conn.execute("SELECT id FROM submissions WHERE paper_id=? AND ended_on IS NULL", (record_id,)).fetchone()
+            fields["paper_code"] = paper_code(data.get("paper_code", previous["paper_code"] if previous else self.next_paper_code()))
+            if self.conn.execute("SELECT 1 FROM papers WHERE paper_code=? AND id<>?", (fields["paper_code"], record_id or 0)).fetchone():
+                raise ValidationError(f"稿件编号 {fields['paper_code']} 已存在，请换一个编号；下一个可用编号为 {self.next_paper_code()}。")
             if fields["stage"] in ("submitted", "revision") and not active and initial is None:
                 raise ValidationError("新建已投稿论文时请填写投稿期刊与日期；已有论文请在详情中登记投稿。")
             if active and fields["stage"] not in ("submitted", "revision", "archived"):
@@ -397,9 +536,9 @@ class Store:
             return record_id
         return self.mutate(action)
 
-    def paper_delete(self, record_id):
+    def paper_delete(self, record_id, data=None):
         def action():
-            self.require("papers", record_id)
+            self.check_revision(self.require("papers", record_id), data or {})
             self.conn.execute("DELETE FROM papers WHERE id=?", (record_id,))
         self.mutate(action, "delete")
 
@@ -417,10 +556,13 @@ class Store:
         def action():
             nonlocal record_id
             paper = self.require("papers", paper_id)
+            self.check_revision(paper, data, "paper_expected_updated_at")
             self.require("journals", fields["journal_id"])
             for journal_id in candidates:
                 self.require("journals", journal_id)
             previous = self.require("submissions", record_id) if record_id else None
+            if previous:
+                self.check_revision(previous, data)
             if previous and previous["paper_id"] != paper_id:
                 raise ValidationError("投稿记录与论文不对应。")
             if fields["ended_on"] is None and self.conn.execute(
@@ -447,7 +589,7 @@ class Store:
                     phase = "submitted"
             elif previous and previous["ended_on"] is None and phase != "archived":
                 phase = "accepted" if fields["result"] == "accepted" else "writing"
-            elif previous and phase != "archived":
+            elif phase != "archived" and (data.get("sync_stage") is True or (not previous and not data.get("historical_only"))):
                 latest = self.conn.execute("SELECT id FROM submissions WHERE paper_id=? ORDER BY submitted_on DESC,id DESC LIMIT 1", (paper_id,)).fetchone()
                 active = self.conn.execute("SELECT 1 FROM submissions WHERE paper_id=? AND ended_on IS NULL", (paper_id,)).fetchone()
                 if latest and latest[0] == record_id and not active:
@@ -456,10 +598,46 @@ class Store:
             return record_id
         return action
 
-    def submission_delete(self, record_id):
+    def transfer_submission(self, record_id, data):
+        def action():
+            previous = self.require("submissions", record_id)
+            self.check_revision(previous, data)
+            paper = self.require("papers", previous["paper_id"])
+            self.check_revision(paper, data, "paper_expected_updated_at")
+            if paper["stage"] in ("accepted", "archived"):
+                raise ValidationError("已录用或归档的论文请先核对阶段，再登记新一轮投稿。")
+            rounds = self.rows("SELECT * FROM submissions WHERE paper_id=? ORDER BY submitted_on DESC,id DESC", (paper["id"],))
+            active = next((r for r in rounds if not r["ended_on"]), None)
+            if (active and active["id"] != record_id) or (not active and rounds[0]["id"] != record_id):
+                raise ValidationError("请从当前进行中的投稿，或最近结束的一轮登记转投。")
+            if previous["ended_on"] is None:
+                result = data.get("result", "rejected")
+                if result not in ("rejected", "withdrawn", "other"):
+                    raise ValidationError("转投前的本轮结果须为拒稿、撤稿或其他结束。")
+                close = {**previous, "ended_on": data.get("ended_on"), "result": result,
+                         "candidate_ids": [r["journal_id"] for r in self.rows("SELECT journal_id FROM candidates WHERE submission_id=? ORDER BY position", (record_id,))]}
+                self._submission_action(paper["id"], close, record_id)()
+                ended_on = close["ended_on"]
+            else:
+                if previous["result"] == "accepted":
+                    raise ValidationError("已录用的轮次不能作为拒稿转投处理。")
+                ended_on = previous["ended_on"]
+            next_round = data.get("next_submission")
+            if not isinstance(next_round, dict) or next_round.get("ended_on") or next_round.get("result"):
+                raise ValidationError("请填写新一轮实际投稿信息，新轮次应为进行中。")
+            fields = submission_fields(next_round, self.day_provider())
+            if fields["submitted_on"] < ended_on:
+                raise ValidationError("新一轮投稿日期不能早于上一轮结束日期。")
+            new_id = self._submission_action(paper["id"], next_round)()
+            return {"id": new_id, "paper_id": paper["id"], "previous_submission_id": record_id}
+        return self.mutate(action)
+
+    def submission_delete(self, record_id, data=None):
         def action():
             record = self.require("submissions", record_id)
+            self.check_revision(record, data or {})
             paper = self.require("papers", record["paper_id"])
+            self.check_revision(paper, data or {}, "paper_expected_updated_at")
             self.conn.execute("DELETE FROM submissions WHERE id=?", (record_id,))
             phase = paper["stage"]
             if record["ended_on"] is None and phase != "archived":
@@ -503,7 +681,7 @@ class Store:
         row = self.conn.execute("SELECT authors FROM papers WHERE trim(authors)<>'' ORDER BY updated_at DESC,id DESC LIMIT 1").fetchone()
         return row[0] if row else ""
 
-    def state(self):
+    def state(self, include_backups=True):
         with self.lock:
             papers = self.rows("SELECT * FROM papers ORDER BY updated_at DESC,id DESC")
             counts = {phase: 0 for phase in STAGES}
@@ -516,14 +694,17 @@ class Store:
                 paper["current_submission"] = self.decorate_submission(current, paper["stage"]) if current else None
                 paper["round_count"] = len(rounds)
                 paper["overdue_days"] = paper["current_submission"]["overdue_days"] if current else 0
+                paper["journal_numbers"] = [r["manuscript_number"] for r in rounds if r["manuscript_number"]]
+                paper["past_journals"] = list(dict.fromkeys(self.require("journals", r["journal_id"])["name"] for r in reversed(rounds) if r["ended_on"]))
             journals = self.rows("SELECT * FROM journals ORDER BY name COLLATE NOCASE,id")
             for journal in journals:
                 journal["usage_count"] = self.conn.execute("SELECT COUNT(*) FROM submissions WHERE journal_id=?", (journal["id"],)).fetchone()[0]
             return {"papers": papers, "journals": journals, "counts": counts,
                     "today": self.day_provider().isoformat(), "overdue_count": sum(p["overdue_days"] > 0 for p in papers),
                     "data_dir": str(self.directory), "database_path": str(self.path),
-                    "backup_dir": str(self.backup_dir), "backups": self.backups(), "app_version": APP_VERSION,
-                    "default_authors": self.default_authors()}
+                    "backup_dir": str(self.backup_dir), "backups": self.backups() if include_backups else [], "app_version": APP_VERSION,
+                    "backup_warning": self.backup_warning, "json_limit_bytes": MAX_JSON_BYTES,
+                    "default_authors": self.default_authors(), "next_paper_code": self.next_paper_code()}
 
     def export(self):
         with self.lock:
@@ -531,16 +712,20 @@ class Store:
                     "data": {table: self.rows(f"SELECT * FROM {table} ORDER BY " + ("submission_id,position" if table == "candidates" else "key" if table == "settings" else "id")) for table in TABLES}}
 
     def validate_export(self, payload):
-        if not isinstance(payload, dict) or payload.get("app") != APP_ID or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, 2, SCHEMA_VERSION):
+        if not isinstance(payload, dict) or payload.get("app") != APP_ID or type(payload.get("schema_version")) is not int or payload["schema_version"] not in SUPPORTED_SCHEMAS:
             raise ValidationError("这不是本平台支持的备份文件。")
         data = payload.get("data")
-        expected_tables = TABLES if payload["schema_version"] == SCHEMA_VERSION else TABLES[:-1]
+        expected_tables = TABLES if payload["schema_version"] >= 3 else TABLES[:-1]
         if not isinstance(data, dict) or set(data) != set(expected_tables):
             raise ValidationError("备份缺少必要的数据表。")
         for name in expected_tables:
             if not isinstance(data[name], list) or len(data[name]) > 100000:
                 raise ValidationError("备份数据格式或大小无效。")
         data = {name: [dict(row) if isinstance(row, dict) else row for row in data[name]] for name in expected_tables}
+        if payload["schema_version"] < 4:
+            if any(not isinstance(row, dict) or type(row.get("id")) is not int for row in data["papers"]):
+                raise ValidationError("备份中的论文编号无效。")
+            numbered_codes(data["papers"])
         data.setdefault("settings", [])
         setting_keys = set()
         for row in data["settings"]:
@@ -552,6 +737,7 @@ class Store:
         papers = {}
         rounds = {}
         file_ids = set()
+        codes = set()
         for row in data["journals"]:
             if not isinstance(row, dict):
                 raise ValidationError("期刊备份格式无效。")
@@ -576,6 +762,10 @@ class Store:
             if ident in papers or row.get("stage") not in STAGES:
                 raise ValidationError("备份包含重复论文或无效阶段。")
             papers[ident] = row
+            code = paper_code(row.get("paper_code"))
+            if code != row["paper_code"] or code in codes:
+                raise ValidationError("备份中的稿件编号未规范化或发生重复。")
+            codes.add(code)
             text_field(row, "title", True, 500)
             text_field(row, "authors", limit=1000)
             text_field(row, "tags", limit=1000)
@@ -666,6 +856,7 @@ class Store:
             if not data["papers"] and self.conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] and allow_empty is not True:
                 raise ValidationError("这份备份含 0 篇论文。若确认要清空当前论文，请在恢复预览中再次确认。")
             def action():
+                self.conn.execute("DELETE FROM operation_receipts")
                 for table in reversed(TABLES):
                     self.conn.execute(f"DELETE FROM {table}")
                 self.insert_export(self.conn, data)
@@ -690,11 +881,33 @@ class Store:
             info = {"name": path.name, "size": path.stat().st_size,
                     "modified_at": dt.datetime.fromtimestamp(path.stat().st_mtime, CHINA).isoformat(timespec="seconds")}
             try:
-                info["counts"] = record_counts(read_snapshot(path)["data"])
+                stat = path.stat()
+                key = (stat.st_size, stat.st_mtime_ns)
+                cached = self._backup_cache.get(path.name)
+                if cached and cached[0] == key:
+                    info["counts"] = cached[1]
+                else:
+                    info["counts"] = snapshot_info(path)
+                    self._backup_cache[path.name] = (key, info["counts"])
             except (ValidationError, OSError):
                 info["counts"] = None
             records.append(info)
         return records
+
+    def diagnostics(self, backups=None):
+        with self.lock:
+            backups = self.backups() if backups is None else backups
+            latest = next((b for b in backups if b["counts"] and b["name"].startswith("latest-")), None)
+            return {"database_path": str(self.path), "counts": record_counts(self.export()["data"]),
+                    "integrity_ok": self.conn.execute("PRAGMA quick_check").fetchone()[0] == "ok" and self.conn.execute("PRAGMA foreign_key_check").fetchone() is None,
+                    "latest_backup": latest, "backup_warning": self.backup_warning,
+                    "last_saved_at": dt.datetime.fromtimestamp(self.path.stat().st_mtime, CHINA).isoformat(timespec="microseconds")}
+
+    def export_bytes(self):
+        payload = json.dumps(self.export(), ensure_ascii=False, indent=2).encode("utf-8")
+        if len(payload) > MAX_JSON_BYTES:
+            raise ValidationError("完整记录超过 20 MB 的 JSON 恢复上限。请从备份文件夹保留 SQLite 完整快照；本次未导出不可恢复的 JSON。")
+        return payload
 
     def snapshot_payload(self, name):
         with self.lock:
@@ -775,11 +988,19 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/health":
                 self.reply(200, {"app": APP_ID, "version": APP_VERSION, "status": "ok", "storage_id": storage_id(store.directory)})
             elif route == "/api/state":
-                self.reply(200, {**store.state(), "token": self.server.token})
+                self.reply(200, {**store.state(include_backups=False), "token": self.server.token})
+            elif route == "/api/backups":
+                with store.lock:
+                    backups = store.backups()
+                    self.reply(200, {"backups": backups, "diagnostics": store.diagnostics(backups)})
+            elif route.startswith("/api/operations/"):
+                with store.lock:
+                    row = store.conn.execute("SELECT result_json FROM operation_receipts WHERE operation_key=?", (route.rsplit("/", 1)[1],)).fetchone()
+                    self.reply(200, {"found": bool(row), "result": json.loads(row[0]) if row else None, "backup_warning": store.backup_warning})
             elif route.startswith("/api/papers/") and route.rsplit("/", 1)[1].isdigit():
                 self.reply(200, store.paper_detail(int(route.rsplit("/", 1)[1])))
             elif route == "/api/export":
-                self.reply(200, store.export(), attachment=f"paperdesk-backup-{today().isoformat()}.json")
+                self.reply(200, store.export_bytes(), attachment=f"paperdesk-backup-{today().isoformat()}.json")
             elif route in ("/", "/index.html", "/app.js", "/style.css", "/interaction.css", "/icons.svg", "/favicon.svg"):
                 filename = "index.html" if route == "/" else route[1:]
                 types = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -798,7 +1019,7 @@ class Handler(BaseHTTPRequestHandler):
             size = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             raise ValidationError("请求内容无效。") from None
-        if not 0 < size <= 20 * 1024 * 1024:
+        if not 0 < size <= MAX_JSON_BYTES:
             raise ValidationError("请求为空或超过 20 MB。")
         if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
             raise ValidationError("请求格式须为 JSON。")
@@ -824,77 +1045,98 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             data = self.read_body()
-            parts = urlparse(self.path).path.strip("/").split("/")
+            route = urlparse(self.path).path
+            parts = route.strip("/").split("/")
             store = self.server.store
-            result = {}
-            if parts == ["api", "journals"] and self.command == "POST":
-                result["id"] = store.journal_save(data)
-            elif len(parts) == 3 and parts[:2] == ["api", "journals"] and parts[2].isdigit():
-                ident = int(parts[2])
-                if self.command == "PUT":
-                    result["id"] = store.journal_save(data, ident)
-                elif self.command == "DELETE":
-                    store.journal_delete(ident)
-                else:
-                    raise ValidationError("操作方式无效。")
-            elif parts == ["api", "papers"] and self.command == "POST":
-                result["id"] = store.paper_save(data)
-            elif len(parts) == 3 and parts[:2] == ["api", "papers"] and parts[2].isdigit():
-                ident = int(parts[2])
-                if self.command == "PUT":
-                    result["id"] = store.paper_save(data, ident)
-                elif self.command == "DELETE":
-                    store.paper_delete(ident)
-                else:
-                    raise ValidationError("操作方式无效。")
-            elif len(parts) == 4 and parts[:2] == ["api", "papers"] and parts[2].isdigit() and parts[3] == "submissions" and self.command == "POST":
-                result["id"] = store.submission_save(int(parts[2]), data)
-            elif len(parts) == 3 and parts[:2] == ["api", "submissions"] and parts[2].isdigit():
-                ident = int(parts[2])
-                if self.command == "PUT":
-                    with store.lock:
-                        paper_id = store.require("submissions", ident)["paper_id"]
-                        result["id"] = store.submission_save(paper_id, data, ident)
-                elif self.command == "DELETE":
-                    store.submission_delete(ident)
-                else:
-                    raise ValidationError("操作方式无效。")
-            elif parts == ["api", "restore"] and self.command == "POST":
-                result["counts"] = store.restore(data, allow_empty=data.get("allow_empty", False))
-            elif parts == ["api", "restore", "preview"] and self.command == "POST":
-                result["counts"] = store.preview_restore(data)
-            elif parts == ["api", "backups", "preview"] and self.command == "POST":
-                result["counts"] = store.preview_restore(store.snapshot_payload(data.get("name")))
-            elif parts == ["api", "backups", "restore"] and self.command == "POST":
-                result["counts"] = store.restore_snapshot(data.get("name"), allow_empty=data.get("allow_empty", False))
-            elif parts == ["api", "open"] and self.command == "POST":
-                store.open_registered(data.get("kind"), data.get("id"))
-            elif parts == ["api", "pick"] and self.command == "POST":
-                kind = data.get("kind")
-                if kind not in ("folder", "file"):
-                    raise ValidationError("选择类型无效。")
-                executable = Path(sys.executable)
-                if executable.name.lower() == "pythonw.exe":
-                    executable = executable.with_name("python.exe")
-                proc = subprocess.run([str(executable), str(ROOT / "pick_path.py"), kind], capture_output=True,
-                                      encoding="utf-8", timeout=600,
-                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                if proc.returncode:
-                    raise ValidationError("无法打开文件选择窗口，请直接粘贴完整路径。")
-                result = json.loads(proc.stdout)
-            elif parts == ["api", "shutdown"] and self.command == "POST":
-                self.reply(200, {"ok": True})
+            if parts != ["api", "shutdown"] and self.headers.get("X-PaperDesk-Client") != APP_VERSION:
+                raise ConflictError("页面与服务版本不一致，请刷新页面后再操作。已保存记录保留在本机。")
+            if self.command in ("PUT", "DELETE") and len(parts) == 3 and parts[1] in ("papers", "journals", "submissions") and not isinstance(data.get("expected_updated_at"), str):
+                raise ConflictError("页面记录版本已更新，请刷新后再保存；当前表单内容仍保留。")
+            transactional = len(parts) >= 2 and (parts[1] in ("papers", "journals", "submissions", "restore") or parts == ["api", "backups", "restore"])
+            action = lambda: self.dispatch(parts, data)
+            result = store.once(self.headers.get("X-PaperDesk-Operation"), f"{self.command}:{route}", data, action) if transactional else action()
+            self.reply(200, {"ok": True, **result, "backup_warning": store.backup_warning})
+            if result.get("shutdown"):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
-                return
-            else:
-                self.reply(404, {"error": "操作不存在。"})
-                return
-            self.reply(200, {"ok": True, **result})
+        except ConflictError as exc:
+            self.reply(409, {"error": str(exc), "code": "conflict"})
         except ValidationError as exc:
             self.reply(400, {"error": str(exc)})
         except Exception:
             logging.exception("Mutation failed")
-            self.reply(500, {"error": "保存或操作失败，当前数据未被覆盖。请重试或查看运行日志。"})
+            self.reply(500, {"error": "保存或操作失败，尚未确认完成。请重试或查看运行日志。"})
+
+    def dispatch(self, parts, data):
+        store = self.server.store
+        result = {}
+        if parts == ["api", "journals"] and self.command == "POST":
+            result["id"] = store.journal_save(data)
+        elif len(parts) == 3 and parts[:2] == ["api", "journals"] and parts[2].isdigit():
+            ident = int(parts[2])
+            if self.command == "PUT":
+                result["id"] = store.journal_save(data, ident)
+            elif self.command == "DELETE":
+                store.journal_delete(ident, data)
+            else:
+                raise ValidationError("操作方式无效。")
+        elif parts == ["api", "papers"] and self.command == "POST":
+            result["id"] = store.paper_save(data)
+        elif len(parts) == 3 and parts[:2] == ["api", "papers"] and parts[2].isdigit():
+            ident = int(parts[2])
+            if self.command == "PUT":
+                result["id"] = store.paper_save(data, ident)
+            elif self.command == "DELETE":
+                store.paper_delete(ident, data)
+            else:
+                raise ValidationError("操作方式无效。")
+        elif len(parts) == 4 and parts[:2] == ["api", "papers"] and parts[2].isdigit() and parts[3] == "submissions" and self.command == "POST":
+            result["id"] = store.submission_save(int(parts[2]), data)
+        elif len(parts) == 3 and parts[:2] == ["api", "submissions"] and parts[2].isdigit():
+            ident = int(parts[2])
+            if self.command == "PUT":
+                with store.lock:
+                    paper_id = store.require("submissions", ident)["paper_id"]
+                    result["id"] = store.submission_save(paper_id, data, ident)
+            elif self.command == "DELETE":
+                store.submission_delete(ident, data)
+            else:
+                raise ValidationError("操作方式无效。")
+        elif len(parts) == 4 and parts[:2] == ["api", "submissions"] and parts[2].isdigit() and parts[3] == "transfer" and self.command == "POST":
+            if not isinstance(data.get("expected_updated_at"), str) or not isinstance(data.get("paper_expected_updated_at"), str):
+                raise ConflictError("请刷新投稿记录后再登记转投。")
+            result = store.transfer_submission(int(parts[2]), data)
+        elif parts == ["api", "backups", "refresh"] and self.command == "POST":
+            with store.lock:
+                store.snapshot("latest")
+                store.backup_warning = None
+        elif parts == ["api", "restore"] and self.command == "POST":
+            result["counts"] = store.restore(data, allow_empty=data.get("allow_empty", False))
+        elif parts == ["api", "restore", "preview"] and self.command == "POST":
+            result["counts"] = store.preview_restore(data)
+        elif parts == ["api", "backups", "preview"] and self.command == "POST":
+            result["counts"] = store.preview_restore(store.snapshot_payload(data.get("name")))
+        elif parts == ["api", "backups", "restore"] and self.command == "POST":
+            result["counts"] = store.restore_snapshot(data.get("name"), allow_empty=data.get("allow_empty", False))
+        elif parts == ["api", "open"] and self.command == "POST":
+            store.open_registered(data.get("kind"), data.get("id"))
+        elif parts == ["api", "pick"] and self.command == "POST":
+            kind = data.get("kind")
+            if kind not in ("folder", "file"):
+                raise ValidationError("选择类型无效。")
+            executable = Path(sys.executable)
+            if executable.name.lower() == "pythonw.exe":
+                executable = executable.with_name("python.exe")
+            proc = subprocess.run([str(executable), str(ROOT / "pick_path.py"), kind], capture_output=True,
+                                  encoding="utf-8", timeout=600,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode:
+                raise ValidationError("无法打开文件选择窗口，请直接粘贴完整路径。")
+            result = json.loads(proc.stdout)
+        elif parts == ["api", "shutdown"] and self.command == "POST":
+            result["shutdown"] = True
+        else:
+            raise ValidationError("操作不存在，请确认平台版本并刷新页面。")
+        return result
 
 
 def default_data_dir():
@@ -916,6 +1158,12 @@ def prepare_default_storage(directory, legacy_dirs=None):
     directory = Path(directory).resolve()
     destination = directory / "paperdesk.sqlite3"
     if destination.exists():
+        try:
+            read_snapshot(destination)
+        except UnsupportedSchema:
+            raise
+        except (ValidationError, OSError) as exc:
+            raise InvalidDatabase(f"现有数据库为空文件、损坏或结构不完整，已停止迁移，原文件没有被覆盖。\n{destination}\n请从有效备份恢复。") from exc
         return
     sources = legacy_data_dirs() if legacy_dirs is None else legacy_dirs
     sources = list(sources)
@@ -940,6 +1188,8 @@ def prepare_default_storage(directory, legacy_dirs=None):
         for row in normalized["papers"]:
             for key in ("planned_on", "writing_started_on", "target_journal_id"):
                 row.setdefault(key, None)
+        if payload["schema_version"] < 4:
+            numbered_codes(normalized["papers"])
         for rows in normalized.values():
             rows.sort(key=lambda row: json.dumps(row, sort_keys=True, ensure_ascii=False))
         signatures.add(json.dumps(normalized, sort_keys=True, ensure_ascii=False))
@@ -972,6 +1222,53 @@ def prepare_default_storage(directory, legacy_dirs=None):
     staged.path.replace(destination)
 
 
+def recover_database(directory, source, confirm):
+    """Explicit startup recovery; validate first and preserve the entire old store."""
+    directory, source = Path(directory).resolve(), Path(source).resolve()
+    if existing_url(directory, legacy=True):
+        raise ValidationError("平台仍在运行，请先退出后再恢复。")
+    if source.suffix.lower() == ".json":
+        if source.stat().st_size > MAX_JSON_BYTES:
+            raise ValidationError("JSON 备份超过 20 MB，请选择 SQLite 完整快照。")
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError):
+            raise ValidationError("所选文件不是有效 JSON 备份。") from None
+    else:
+        payload = read_snapshot(source)
+    recovery = directory / "recovery" / f"{today().isoformat()}-{time.time_ns()}"
+    staged = Store(recovery)
+    try:
+        counts = staged.preview_restore(payload)
+        if not confirm(counts):
+            return None
+        staged.restore(payload, allow_empty=True)
+        staged.snapshot("recovery")
+    finally:
+        staged.close()
+    original = directory / "paperdesk.sqlite3"
+    if original.exists():
+        shutil.copy2(original, recovery / "original-database.invalid")
+    saved_backups = recovery / "previous-backups"
+    saved_backups.mkdir(exist_ok=True)
+    for path in (directory / "backups").glob("*.sqlite3"):
+        shutil.copy2(path, saved_backups / path.name)
+    backups = directory / "backups"
+    backups.mkdir(exist_ok=True)
+    for path in staged.backup_dir.glob("recovery-*.sqlite3"):
+        shutil.copy2(path, backups / path.name)
+    staged.path.replace(original)
+    restored = Store(directory)
+    try:
+        try:
+            restored.snapshot("latest")
+        except (OSError, sqlite3.Error, ValidationError):
+            logging.exception("Recovery completed; latest backup refresh failed; recovery snapshot retained")
+    finally:
+        restored.close()
+    return counts
+
+
 class LocalServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
@@ -999,7 +1296,11 @@ def existing_url(directory, *, legacy=False):
         url = f"http://127.0.0.1:{port}"
         with urlopen(url + "/api/health", timeout=1) as response:
             payload = json.load(response)
-            return url if payload.get("app") == APP_ID and (legacy or payload.get("storage_id") == storage_id(directory)) else None
+            if payload.get("app") != APP_ID or (not legacy and payload.get("storage_id") != storage_id(directory)):
+                return None
+            if not legacy and payload.get("version") != APP_VERSION:
+                raise ValidationError(f"旧版平台 {payload.get('version', '')} 仍在运行。请在旧页面退出平台，再启动新版 {APP_VERSION}。已保存记录保留在本机。")
+            return url
     except (OSError, ValueError, KeyError, TypeError):
         return None
 

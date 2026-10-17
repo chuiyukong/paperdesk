@@ -17,3 +17,5 @@ jobs:
         run: python -B -m unittest -v test_paperdesk
       - name: Verify browser script syntax
         run: node --check web/app.js
+      - name: Verify frontend workflows without dependencies
+        run: node test_frontend.js

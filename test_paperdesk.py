@@ -3,6 +3,7 @@ import copy
 from contextlib import closing
 import datetime as dt
 import json
+import io
 import sqlite3
 import tempfile
 import threading
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from paperdesk import Store, ValidationError, make_server, default_data_dir, legacy_data_dirs, prepare_default_storage, existing_url, storage_id
+from paperdesk import Store, ValidationError, make_server, SCHEMA_VERSION, APP_VERSION, ConflictError, InvalidDatabase, UnsupportedSchema, recover_database, default_data_dir, legacy_data_dirs, prepare_default_storage, existing_url, storage_id
 
 
 class StoreTests(unittest.TestCase):
@@ -198,18 +199,18 @@ class StoreTests(unittest.TestCase):
 
     def test_automatic_snapshot_integrity_retention_and_restore(self):
         backups = self.store.backups()
-        self.assertEqual(len(backups), 1)
+        self.assertEqual(len(backups), 2)
         with closing(sqlite3.connect(self.store.backup_dir / backups[0]["name"])) as saved:
             self.assertEqual(saved.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         exported = self.store.export()
         self.store.snapshot("restore")
-        snapshot = self.store.backups()[0]["name"]
+        snapshot = next(b["name"] for b in self.store.backups() if b["name"].startswith("restore-"))
         self.store.paper_delete(self.paper)
         self.store.restore_snapshot(snapshot)
         self.assertEqual(self.store.export()["data"], exported["data"])
         self.day += dt.timedelta(days=31)
         self.store.journal_save({"name": "新的一天"})
-        self.assertEqual(len(self.store.backups()), 1)
+        self.assertEqual(len(self.store.backups()), 2)
         with self.assertRaises(ValidationError):
             self.store.restore_snapshot("../../paperdesk.sqlite3")
 
@@ -267,7 +268,7 @@ class StoreTests(unittest.TestCase):
         for journal in expected["journals"]:
             journal["guidelines_url"] = ""
         for paper in expected["papers"]:
-            paper.update(planned_on=None, writing_started_on=None, target_journal_id=None)
+            paper.update(planned_on=None, writing_started_on=None, target_journal_id=None, paper_code=f"{paper["id"]:04d}")
         self.assertEqual(restored, expected)
         self.assertEqual(payload, original)
 
@@ -281,11 +282,12 @@ class StoreTests(unittest.TestCase):
             Store.insert_export(old, data)
             old.commit()
         self.store = Store(Path(self.temp.name), lambda: self.day)
-        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
         for paper in self.store.export()["data"]["papers"]:
             paper.pop("planned_on")
             paper.pop("writing_started_on")
             paper.pop("target_journal_id")
+            paper.pop("paper_code")
             self.assertIn(paper, data["papers"])
         snapshot = next(b["name"] for b in self.store.backups() if b["name"].startswith("upgrade-"))
         with closing(sqlite3.connect(self.store.backup_dir / snapshot)) as saved:
@@ -309,7 +311,7 @@ class StoreTests(unittest.TestCase):
             Store.insert_export(old, data)
             old.commit()
         self.store = Store(Path(self.temp.name), lambda: self.day)
-        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.store.conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
         ident = data["papers"][0]["id"]
         self.assertEqual(self.store.paper_detail(ident)["writing_started_on"], "2024-02-01")
         self.assertEqual(self.store.state()["default_authors"], "测试作者")
@@ -398,6 +400,166 @@ class StoreTests(unittest.TestCase):
         document.unlink()
         with self.assertRaisesRegex(ValidationError, "重新关联"):
             self.store.open_registered("file", file_id)
+
+    def test_paper_code_suggestions_normalization_uniqueness_and_restore(self):
+        self.assertEqual(self.store.require("papers", self.paper)["paper_code"], "0001")
+        self.assertEqual(self.store.next_paper_code(), "0002")
+        second = self.store.paper_save({"title": "自定义编号", "paper_code": " ms-009 ", "stage": "writing"})
+        self.assertEqual(self.store.require("papers", second)["paper_code"], "MS-009")
+        self.assertEqual(self.store.next_paper_code(), "MS-010")
+
+        with self.assertRaisesRegex(ValidationError, "已存在"):
+            self.store.paper_save({"title": "不得重复", "paper_code": "ｍｓ-００９", "stage": "writing"})
+        self.assertEqual(len(self.store.state()["papers"]), 2)
+        exported = self.store.export()
+        self.store.restore(exported)
+        self.assertEqual(self.store.export()["data"], exported["data"])
+        self.assertEqual(self.store.next_paper_code(), "MS-010")
+
+    def test_very_long_number_suggestion_remains_valid(self):
+        self.store.paper_save({"title": "长编号", "stage": "writing", "paper_code": "A" * 63 + "9"})
+        suggestion = self.store.next_paper_code()
+        self.assertLessEqual(len(suggestion), 64)
+        self.store.paper_save({"title": "仍可新建", "stage": "writing", "paper_code": suggestion})
+
+    def test_new_closed_acceptance_syncs_but_history_edits_preserve_manual_stage(self):
+        closed = self.submission(submitted_on="2026-09-01", ended_on="2026-10-10", result="accepted")
+        ident = self.store.submission_save(self.paper, closed)
+        self.assertEqual(self.store.paper_detail(self.paper)["stage"], "accepted")
+        self.store.paper_save({"title": "计划重做", "stage": "planned", "planned_on": "2026-09-01"}, self.paper)
+        self.store.submission_save(self.paper, {**closed, "notes": "只改旧备注"}, ident)
+        self.assertEqual(self.store.paper_detail(self.paper)["stage"], "planned")
+        self.store.submission_save(self.paper, {**closed, "sync_stage": True}, ident)
+        self.assertEqual(self.store.paper_detail(self.paper)["stage"], "accepted")
+
+    def test_explicit_history_add_does_not_change_current_stage(self):
+        closed = self.submission(submitted_on="2026-09-01", ended_on="2026-10-10", result="accepted", historical_only=True)
+        self.store.submission_save(self.paper, closed)
+        self.assertEqual(self.store.paper_detail(self.paper)["stage"], "writing")
+
+    def test_transfer_is_atomic_keeps_old_round_and_global_identifier(self):
+        first = self.submission(submitted_on="2026-09-01", manuscript_number="OLD-J-001", transfer_mode="days", wait_days=30)
+        old_id = self.store.submission_save(self.paper, first)
+        code = self.store.require("papers", self.paper)["paper_code"]
+        old = self.store.require("submissions", old_id)
+        paper = self.store.require("papers", self.paper)
+        data = {"expected_updated_at": old["updated_at"], "paper_expected_updated_at": paper["updated_at"], "ended_on": "2026-10-13", "result": "rejected", "next_submission": self.submission(journal_id=self.next_journal, manuscript_number="NEW-J-002", candidate_ids=[])}
+        result = self.store.transfer_submission(old_id, data)
+        detail = self.store.paper_detail(self.paper)
+        self.assertEqual(detail["paper_code"], code)
+        self.assertEqual(detail["stage"], "submitted")
+        self.assertEqual(len(detail["submissions"]), 2)
+        ended = next(r for r in detail["submissions"] if r["id"] == old_id)
+        active = next(r for r in detail["submissions"] if not r["ended_on"])
+        self.assertEqual(ended["result"], "rejected")
+        self.assertEqual(ended["elapsed_days"], 42)
+        self.assertEqual(ended["manuscript_number"], "OLD-J-001")
+        self.assertEqual(ended["target_on"], "2026-10-01")
+        self.assertEqual(active["id"], result["id"])
+        self.assertEqual(active["elapsed_days"], 0)
+        self.assertEqual(active["manuscript_number"], "NEW-J-002")
+        self.assertEqual(active["overdue_days"], 0)
+        state_paper = next(p for p in self.store.state()["papers"] if p["id"] == self.paper)
+        self.assertEqual(state_paper["past_journals"], ["测试期刊"])
+        self.assertCountEqual(state_paper["journal_numbers"], ["OLD-J-001", "NEW-J-002"])
+        self.day += dt.timedelta(days=1)
+        self.assertEqual(next(r for r in self.store.paper_detail(self.paper)["submissions"] if r["id"] == old_id)["elapsed_days"], 42)
+
+    def test_invalid_transfer_rolls_back_old_end_and_all_changes(self):
+        old_id = self.store.submission_save(self.paper, self.submission(submitted_on="2026-09-01"))
+        before = self.store.export()["data"]
+        for next_round in (self.submission(journal_id=999), self.submission(submitted_on="2026-10-01"), self.submission(candidate_ids=[999])):
+            with self.subTest(next_round=next_round), self.assertRaises(ValidationError):
+                self.store.transfer_submission(old_id, {"ended_on": "2026-10-13", "result": "rejected", "next_submission": next_round})
+            self.assertEqual(self.store.export()["data"], before)
+        self.store.conn.execute("CREATE TEMP TRIGGER fail_transfer BEFORE INSERT ON submissions BEGIN SELECT RAISE(ABORT, 'simulated disk full'); END")
+        try:
+            with self.assertRaises(ValidationError):
+                self.store.transfer_submission(old_id, {"ended_on": "2026-10-13", "result": "withdrawn", "next_submission": self.submission(journal_id=self.next_journal, candidate_ids=[])})
+        finally:
+            self.store.conn.execute("DROP TRIGGER fail_transfer")
+        self.assertEqual(self.store.export()["data"], before)
+
+    def test_transfer_from_already_closed_round_preserves_its_end(self):
+        old = self.submission(submitted_on="2026-09-01", ended_on="2026-10-10", result="rejected")
+        old_id = self.store.submission_save(self.paper, old)
+        self.store.transfer_submission(old_id, {"next_submission": self.submission(journal_id=self.next_journal, candidate_ids=[])})
+        previous = self.store.require("submissions", old_id)
+        self.assertEqual(previous["ended_on"], "2026-10-10")
+        self.assertEqual(previous["result"], "rejected")
+
+    def test_corrupt_daily_is_preserved_and_replaced_latest_contains_new_record(self):
+        daily = self.store.backup_dir / f"daily-{self.day.isoformat()}.sqlite3"
+        daily.write_bytes(b"broken")
+        self.store.paper_save({"title": "新记录", "stage": "writing"})
+        self.assertTrue(any(p.read_bytes() == b"broken" for p in self.store.backup_dir.glob("damaged-*.sqlite3")))
+        latest = next(b for b in self.store.backups() if b["name"].startswith("latest-"))
+        self.assertEqual(latest["counts"]["papers"], 2)
+        self.assertIsNotNone(next(b for b in self.store.backups() if b["name"] == daily.name)["counts"])
+
+    def test_latest_backup_failure_acknowledges_committed_save(self):
+        original = self.store.snapshot
+        def fail_latest(reason="daily"):
+            if reason == "latest":
+                raise OSError("simulated disk full")
+            return original(reason)
+        with patch.object(self.store, "snapshot", side_effect=fail_latest), self.assertLogs(level="ERROR"):
+            ident = self.store.paper_save({"title": "记录保存了", "stage": "writing"})
+        self.assertEqual(self.store.require("papers", ident)["title"], "记录保存了")
+        self.assertIn("记录已保存", self.store.backup_warning)
+        self.store.paper_save({"title": "下一次成功", "stage": "writing"})
+        self.assertIsNone(self.store.backup_warning)
+
+    def test_stale_edits_rejected_for_paper_journal_and_round(self):
+        old = self.store.require("papers", self.paper)
+        self.store.paper_save({**old, "title": "另一页改过"}, self.paper)
+        with self.assertRaises(ConflictError):
+            self.store.paper_save({**old, "notes": "旧表单", "expected_updated_at": old["updated_at"]}, self.paper)
+        self.assertEqual(self.store.require("papers", self.paper)["title"], "另一页改过")
+        old_j = self.store.require("journals", self.journal)
+        self.store.journal_save({**old_j, "notes": "另一页改过"}, self.journal)
+        with self.assertRaises(ConflictError):
+            self.store.journal_save({**old_j, "expected_updated_at": old_j["updated_at"]}, self.journal)
+        ident = self.store.submission_save(self.paper, self.submission())
+        old_r = self.store.require("submissions", ident)
+        self.store.submission_save(self.paper, self.submission(progress="另一页更新"), ident)
+        with self.assertRaises(ConflictError):
+            self.store.submission_save(self.paper, self.submission(expected_updated_at=old_r["updated_at"]), ident)
+
+    def test_stale_paper_stage_blocks_round_save_and_delete(self):
+        ident = self.store.submission_save(self.paper, self.submission())
+        old_paper = self.store.require("papers", self.paper)
+        old_round = self.store.require("submissions", ident)
+        self.store.paper_save({**old_paper, "stage": "revision"}, self.paper)
+        guard = {"expected_updated_at": old_round["updated_at"], "paper_expected_updated_at": old_paper["updated_at"]}
+        with self.assertRaises(ConflictError):
+            self.store.submission_save(self.paper, self.submission(**guard), ident)
+        with self.assertRaises(ConflictError):
+            self.store.submission_delete(ident, guard)
+        self.assertEqual(self.store.require("papers", self.paper)["stage"], "revision")
+        self.assertIsNone(self.store.require("submissions", ident)["ended_on"])
+
+    def test_once_receipt_is_atomic_and_survives_reopen(self):
+        key = "operation-create-001"
+        payload = {"title": "只创建一次", "stage": "writing"}
+        def create():
+            return {"id": self.store.paper_save(payload)}
+        first = self.store.once(key, "POST:/api/papers", payload, create)
+        self.assertEqual(self.store.once(key, "POST:/api/papers", payload, create), first)
+        self.store.close()
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.once(key, "POST:/api/papers", payload, create), first)
+        self.assertEqual(len(self.store.state()["papers"]), 2)
+        with self.assertRaises(ConflictError):
+            self.store.once(key, "POST:/api/papers", {**payload, "title": "改了内容"}, create)
+        def crash_after_insert():
+            self.store.paper_save({"title": "不留半条", "stage": "writing"})
+            raise OSError("simulated response construction failure")
+        before = self.store.export()["data"]
+        with self.assertRaises(OSError):
+            self.store.once("operation-failure-001", "POST:/api/papers", {}, crash_after_insert)
+        self.assertEqual(self.store.export()["data"], before)
+        self.assertIsNone(self.store.conn.execute("SELECT 1 FROM operation_receipts WHERE operation_key='operation-failure-001'").fetchone())
 
 
 class StorageMigrationTests(unittest.TestCase):
@@ -499,6 +661,55 @@ class StorageMigrationTests(unittest.TestCase):
         self.assertFalse((self.target / "paperdesk.sqlite3").exists())
 
 
+    def test_zero_byte_store_requires_explicit_validated_recovery(self):
+        source, expected = self.seed("source", "保留的记录")
+        self.target.mkdir()
+        broken = self.target / "paperdesk.sqlite3"
+        broken.write_bytes(b"")
+        with self.assertRaises(InvalidDatabase):
+            prepare_default_storage(self.target, [source])
+        with self.assertRaises(InvalidDatabase):
+            Store(self.target)
+        self.assertEqual(broken.read_bytes(), b"")
+        self.assertIsNone(recover_database(self.target, source / "paperdesk.sqlite3", lambda counts: False))
+        self.assertEqual(broken.read_bytes(), b"")
+        result = recover_database(self.target, source / "paperdesk.sqlite3", lambda counts: counts["papers"] == 1)
+        self.assertEqual(result["papers"], 1)
+        with closing(Store(self.target)) as store:
+            self.assertEqual(store.export()["data"], expected)
+        self.assertTrue(list((self.target / "recovery").glob("*/original-database.invalid")))
+
+    def test_v3_schema_upgrade_and_json_preserve_original_data(self):
+        source, original = self.seed("v3", "原有数据")
+        old_data = copy.deepcopy(original)
+        for row in old_data["papers"]:
+            row.pop("paper_code")
+        database = source / "paperdesk.sqlite3"
+        database.unlink()
+        with closing(sqlite3.connect(database)) as connection:
+            connection.executescript((Path(__file__).parent / "testdata" / "v3-schema.sql").read_text(encoding="utf-8"))
+            Store.insert_export(connection, old_data)
+            connection.commit()
+        with closing(Store(source)) as store:
+            self.assertEqual(store.export()["data"], original)
+            self.assertEqual(store.conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            self.assertTrue(any(b["name"].startswith("upgrade-") for b in store.backups()))
+            store.restore({"app": "paperdesk-local-v1", "schema_version": 3, "data": old_data})
+            self.assertEqual(store.export()["data"], original)
+
+    def test_future_schema_is_not_treated_as_a_damaged_database(self):
+        source, _ = self.seed("future", "高版本数据")
+        database = source / "paperdesk.sqlite3"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("PRAGMA user_version = 99")
+        before = database.read_bytes()
+        with self.assertRaises(UnsupportedSchema):
+            Store(source)
+        with self.assertRaises(UnsupportedSchema):
+            prepare_default_storage(source, [])
+        self.assertEqual(database.read_bytes(), before)
+
+
 class APITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="paperdesk-api-")
@@ -516,9 +727,12 @@ class APITests(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, path, method="GET", data=None, headers=None):
+        headers = dict(headers or {})
+        if method != "GET":
+            headers.setdefault("X-PaperDesk-Client", APP_VERSION)
         req = Request(self.url + path, method=method,
                       data=json.dumps(data).encode() if data is not None else None,
-                      headers=headers or {})
+                      headers=headers)
         try:
             response = urlopen(req, timeout=3)
         except HTTPError as error:
@@ -587,7 +801,7 @@ class APITests(unittest.TestCase):
         self.store.paper_save({"title": "保留论文", "stage": "writing"})
         before = self.store.export()
         headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url}
-        empty = self.store.backups()[0]["name"]
+        empty = next(b["name"] for b in self.store.backups() if b["counts"] and b["counts"]["papers"] == 0)
         code, body, _ = self.request("/api/backups/preview", "POST", {"name": empty}, headers)
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["counts"]["papers"], 0)
@@ -603,6 +817,61 @@ class APITests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["counts"]["papers"], 1)
         self.assertEqual(self.store.export()["data"], before["data"])
+
+
+    def test_operation_receipt_retries_create_and_put_without_duplicates(self):
+        headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url, "X-PaperDesk-Operation": "create-operation-001"}
+        payload = {"title": "只新建一次", "stage": "writing", "paper_code": "A001"}
+        first = self.request("/api/papers", "POST", payload, headers)
+        second = self.request("/api/papers", "POST", payload, headers)
+        self.assertEqual(first[0], 200)
+        self.assertEqual(json.loads(first[1])["id"], json.loads(second[1])["id"])
+        self.assertEqual(len(self.store.state()["papers"]), 1)
+        ident = json.loads(first[1])["id"]
+        code, body, _ = self.request("/api/operations/create-operation-001")
+        self.assertTrue(json.loads(body)["found"])
+        self.assertEqual(self.request("/api/papers", "POST", {**payload, "title": "不能复用标识"}, headers)[0], 409)
+        old = self.store.require("papers", ident)
+        update = {**old, "notes": "改一次", "expected_updated_at": old["updated_at"]}
+        headers["X-PaperDesk-Operation"] = "edit-operation-001"
+        self.assertEqual(self.request(f"/api/papers/{ident}", "PUT", update, headers)[0], 200)
+        self.assertEqual(self.request(f"/api/papers/{ident}", "PUT", update, headers)[0], 200)
+        headers["X-PaperDesk-Operation"] = "stale-operation-001"
+        self.assertEqual(self.request(f"/api/papers/{ident}", "PUT", update, headers)[0], 409)
+
+    def test_transfer_request_replay_keeps_exactly_two_rounds(self):
+        journal = self.store.journal_save({"name": "原期刊"})
+        next_journal = self.store.journal_save({"name": "下一期刊"})
+        paper = self.store.paper_save({"title": "转投论文", "stage": "submitted", "initial_submission": {"journal_id": journal, "submitted_on": "2024-12-31", "candidate_ids": [next_journal]}})
+        current = self.store.paper_detail(paper)["submissions"][0]
+        payload = {"expected_updated_at": current["updated_at"], "paper_expected_updated_at": self.store.require("papers", paper)["updated_at"], "ended_on": "2025-01-02", "result": "rejected", "next_submission": {"journal_id": next_journal, "submitted_on": "2025-01-03"}}
+        headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url, "X-PaperDesk-Operation": "transfer-operation-001"}
+        path = f"/api/submissions/{current['id']}/transfer"
+        self.assertEqual(self.request(path, "POST", payload, headers)[0], 200)
+        self.assertEqual(self.request(path, "POST", payload, headers)[0], 200)
+        self.assertEqual(len(self.store.paper_detail(paper)["submissions"]), 2)
+        self.assertEqual(sum(not r["ended_on"] for r in self.store.paper_detail(paper)["submissions"]), 1)
+
+    def test_home_state_does_not_scan_backups_and_export_limit_is_explicit(self):
+        with patch.object(self.store, "backups", side_effect=AssertionError("Home must not scan all snapshots")):
+            self.assertEqual(self.request("/api/state")[0], 200)
+        with patch("paperdesk.MAX_JSON_BYTES", 10):
+            code, body, _ = self.request("/api/export")
+        self.assertEqual(code, 400)
+        self.assertIn("恢复上限", json.loads(body)["error"])
+
+    def test_old_page_client_cannot_mutate_new_service(self):
+        headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url, "X-PaperDesk-Client": "1.2.1"}
+        self.assertEqual(self.request("/api/papers", "POST", {"title": "旧页面不能新建", "stage": "writing"}, headers)[0], 409)
+        headers["X-PaperDesk-Client"] = ""
+        self.assertEqual(self.request("/api/papers", "POST", {"title": "缺少页面版本", "stage": "writing"}, headers)[0], 409)
+        self.assertEqual(self.store.state()["papers"], [])
+
+    def test_repeat_launch_reports_older_service_version(self):
+        (self.store.directory / "instance.json").write_text(json.dumps({"port": self.server.server_port}), encoding="utf-8")
+        health = {"app": "paperdesk-local-v1", "version": "1.2.1", "storage_id": storage_id(self.store.directory)}
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(health).encode())), self.assertRaisesRegex(ValidationError, "旧版平台"):
+            existing_url(self.store.directory)
 
 
 if __name__ == "__main__":
