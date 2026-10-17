@@ -7,6 +7,8 @@ __pycache__/
 instance.json
 backups/
 dist/
+migration/
+migration-report.json
 .env
 .env.*
 论文管理台-完整备份-*.json

@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -177,9 +179,39 @@ def submission_fields(data, current_day):
     }
 
 
+def read_snapshot(path):
+    """Read a consistent, read-only snapshot, including supported older formats."""
+    connection = None
+    try:
+        connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (1, 2, SCHEMA_VERSION) or connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValidationError("数据库或备份损坏，或版本不兼容；原文件已保留。")
+        if connection.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValidationError("数据库的记录关联不完整；原文件已保留。")
+        tables = TABLES if version == SCHEMA_VERSION else TABLES[:-1]
+        return {"app": APP_ID, "schema_version": version,
+                "data": {table: [dict(r) for r in connection.execute(f"SELECT * FROM {table}")] for table in tables}}
+    except sqlite3.Error:
+        raise ValidationError("无法读取数据库或备份，原文件没有被修改。") from None
+    finally:
+        if connection:
+            connection.close()
+
+
+def record_counts(data):
+    return {table: len(data[table]) for table in ("papers", "journals", "submissions", "files")}
+
+
+def storage_id(directory):
+    return hashlib.sha256(os.path.normcase(str(Path(directory).resolve())).encode("utf-8")).hexdigest()
+
+
 class Store:
     def __init__(self, directory: Path, day_provider=today):
-        self.directory = Path(directory)
+        self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.backup_dir = self.directory / "backups"
         self.backup_dir.mkdir(exist_ok=True)
@@ -608,26 +640,37 @@ class Store:
             raise ValidationError("备份中的候选期刊顺序不连续。")
         return data
 
-    def restore(self, payload):
+    def validated_restore_data(self, payload):
+        data = self.validate_export(payload)
+        # Validate the exact SQL representation before touching the live database.
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("PRAGMA foreign_keys=ON")
+            probe.executescript(SCHEMA)
+            self.insert_export(probe, data)
+            if probe.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValidationError("备份完整性检查未通过。")
+        except (sqlite3.Error, KeyError, TypeError, ValueError):
+            raise ValidationError("备份内容不完整或存在冲突，当前数据没有被修改。") from None
+        finally:
+            probe.close()
+        return data
+
+    def preview_restore(self, payload):
         with self.lock:
-            data = self.validate_export(payload)
-            # Validate the exact SQL representation in isolation before touching the live database.
-            probe = sqlite3.connect(":memory:")
-            try:
-                probe.execute("PRAGMA foreign_keys=ON")
-                probe.executescript(SCHEMA)
-                self.insert_export(probe, data)
-                if probe.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise ValidationError("备份完整性检查未通过。")
-            except (sqlite3.Error, KeyError, TypeError, ValueError):
-                raise ValidationError("备份内容不完整或存在冲突，当前数据没有被修改。") from None
-            finally:
-                probe.close()
+            return record_counts(self.validated_restore_data(payload))
+
+    def restore(self, payload, allow_empty=False):
+        with self.lock:
+            data = self.validated_restore_data(payload)
+            if not data["papers"] and self.conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] and allow_empty is not True:
+                raise ValidationError("这份备份含 0 篇论文。若确认要清空当前论文，请在恢复预览中再次确认。")
             def action():
                 for table in reversed(TABLES):
                     self.conn.execute(f"DELETE FROM {table}")
                 self.insert_export(self.conn, data)
             self.mutate(action, "restore")
+            return record_counts(data)
 
     @staticmethod
     def insert_export(connection, data):
@@ -642,30 +685,26 @@ class Store:
                 connection.execute(query, [row[c] for c in columns])
 
     def backups(self):
-        return [{"name": path.name, "size": path.stat().st_size,
-                 "modified_at": dt.datetime.fromtimestamp(path.stat().st_mtime, CHINA).isoformat(timespec="seconds")}
-                for path in sorted(self.backup_dir.glob("*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)]
-
-    def restore_snapshot(self, name):
-        with self.lock:
-            if not isinstance(name, str) or name not in {b["name"] for b in self.backups()}:
-                raise ValidationError("自动备份不存在，请刷新列表。")
-            path = self.backup_dir / name
-            connection = None
+        records = []
+        for path in sorted(self.backup_dir.glob("*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True):
+            info = {"name": path.name, "size": path.stat().st_size,
+                    "modified_at": dt.datetime.fromtimestamp(path.stat().st_mtime, CHINA).isoformat(timespec="seconds")}
             try:
-                connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
-                connection.row_factory = sqlite3.Row
-                version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or version not in (1, 2, SCHEMA_VERSION):
-                    raise ValidationError("自动备份损坏或版本不兼容。")
-                payload = {"app": APP_ID, "schema_version": version,
-                           "data": {table: [dict(r) for r in connection.execute(f"SELECT * FROM {table}")] for table in (TABLES if version == SCHEMA_VERSION else TABLES[:-1])}}
-            except sqlite3.Error:
-                raise ValidationError("无法读取这份备份，当前数据没有被修改。") from None
-            finally:
-                if connection:
-                    connection.close()
-            self.restore(payload)
+                info["counts"] = record_counts(read_snapshot(path)["data"])
+            except (ValidationError, OSError):
+                info["counts"] = None
+            records.append(info)
+        return records
+
+    def snapshot_payload(self, name):
+        with self.lock:
+            if not isinstance(name, str) or name != Path(name).name or not name.endswith(".sqlite3") or not (self.backup_dir / name).is_file():
+                raise ValidationError("自动备份不存在，请刷新列表。")
+            return read_snapshot(self.backup_dir / name)
+
+    def restore_snapshot(self, name, allow_empty=False):
+        with self.lock:
+            return self.restore(self.snapshot_payload(name), allow_empty=allow_empty)
 
     def open_registered(self, kind, ident):
         with self.lock:
@@ -734,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         try:
             if route == "/api/health":
-                self.reply(200, {"app": APP_ID, "version": APP_VERSION, "status": "ok"})
+                self.reply(200, {"app": APP_ID, "version": APP_VERSION, "status": "ok", "storage_id": storage_id(store.directory)})
             elif route == "/api/state":
                 self.reply(200, {**store.state(), "token": self.server.token})
             elif route.startswith("/api/papers/") and route.rsplit("/", 1)[1].isdigit():
@@ -821,9 +860,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ValidationError("操作方式无效。")
             elif parts == ["api", "restore"] and self.command == "POST":
-                store.restore(data)
+                result["counts"] = store.restore(data, allow_empty=data.get("allow_empty", False))
+            elif parts == ["api", "restore", "preview"] and self.command == "POST":
+                result["counts"] = store.preview_restore(data)
+            elif parts == ["api", "backups", "preview"] and self.command == "POST":
+                result["counts"] = store.preview_restore(store.snapshot_payload(data.get("name")))
             elif parts == ["api", "backups", "restore"] and self.command == "POST":
-                store.restore_snapshot(data.get("name"))
+                result["counts"] = store.restore_snapshot(data.get("name"), allow_empty=data.get("allow_empty", False))
             elif parts == ["api", "open"] and self.command == "POST":
                 store.open_registered(data.get("kind"), data.get("id"))
             elif parts == ["api", "pick"] and self.command == "POST":
@@ -855,7 +898,78 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def default_data_dir():
-    return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "PaperDesk"
+    # MSIX redirects LocalAppData differently for packaged and Explorer launches.
+    # The user profile root is shared by both contexts and is outside that redirect.
+    return Path.home() / "PaperDesk"
+
+
+def legacy_data_dirs():
+    local = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    paths = [local / "PaperDesk"]
+    paths.extend(path / "LocalCache" / "Local" / "PaperDesk"
+                 for path in (local / "Packages").glob("OpenAI.Codex_*"))
+    return sorted({p.resolve() for p in paths if (p / "paperdesk.sqlite3").is_file()}, key=str)
+
+
+def prepare_default_storage(directory, legacy_dirs=None):
+    """Migrate once, preserving all legacy files; never replace an initialized store."""
+    directory = Path(directory).resolve()
+    destination = directory / "paperdesk.sqlite3"
+    if destination.exists():
+        return
+    sources = legacy_data_dirs() if legacy_dirs is None else legacy_dirs
+    sources = list(sources)
+    for source in sources:
+        if existing_url(Path(source), legacy=True):
+            raise ValidationError("旧版平台仍在运行。请先在旧页面点击“退出平台”，再启动新版；旧记录没有被修改。")
+    found = []
+    signatures = set()
+    for source in sorted({(Path(p) / "paperdesk.sqlite3").resolve().parent for p in sources}, key=str):
+        path = source / "paperdesk.sqlite3"
+        if not path.is_file() or source == directory:
+            continue
+        payload = read_snapshot(path)
+        data = payload["data"]
+        if not any(data[t] for t in ("papers", "journals", "submissions", "files")):
+            continue
+        # Compare older and newer representations without modifying either source.
+        normalized = json.loads(json.dumps(data))
+        normalized.setdefault("settings", [])
+        for row in normalized["journals"]:
+            row.setdefault("guidelines_url", "")
+        for row in normalized["papers"]:
+            for key in ("planned_on", "writing_started_on", "target_journal_id"):
+                row.setdefault(key, None)
+        for rows in normalized.values():
+            rows.sort(key=lambda row: json.dumps(row, sort_keys=True, ensure_ascii=False))
+        signatures.add(json.dumps(normalized, sort_keys=True, ensure_ascii=False))
+        found.append((source, payload))
+    if len(signatures) > 1:
+        raise ValidationError("发现多份内容不同的旧数据库，未自动覆盖任何记录。请先保留这些目录并核对：\n" + "\n".join(str(p) for p, _ in found))
+    if not found:
+        return
+    # Stage a validated copy and its backups before publishing the new database.
+    directory.mkdir(parents=True, exist_ok=True)
+    staging = directory / "migration" / f"{today().isoformat()}-{time.time_ns()}"
+    staged = Store(staging)
+    try:
+        staged.restore(found[0][1])
+        staged.snapshot("migration")
+        for source, _ in found:
+            for old in (source / "backups").glob("*.sqlite3"):
+                target = staged.backup_dir / old.name
+                if target.exists():
+                    target = staged.backup_dir / f"imported-{today().isoformat()}-{time.time_ns()}.sqlite3"
+                shutil.copy2(old, target)
+        counts = record_counts(staged.export()["data"])
+    finally:
+        staged.close()
+    backups = directory / "backups"
+    backups.mkdir(exist_ok=True)
+    for path in staged.backup_dir.glob("*.sqlite3"):
+        shutil.copy2(path, backups / path.name)
+    (directory / "migration-report.json").write_text(json.dumps({"migrated_at": timestamp(), "sources": [str(p) for p, _ in found], "counts": counts}, ensure_ascii=False, indent=2), encoding="utf-8")
+    staged.path.replace(destination)
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -875,7 +989,7 @@ def make_server(store, port=0):
     return server
 
 
-def existing_url(directory):
+def existing_url(directory, *, legacy=False):
     from urllib.request import urlopen
     try:
         state = json.loads((directory / "instance.json").read_text(encoding="utf-8"))
@@ -885,26 +999,23 @@ def existing_url(directory):
         url = f"http://127.0.0.1:{port}"
         with urlopen(url + "/api/health", timeout=1) as response:
             payload = json.load(response)
-            return url if payload.get("app") == APP_ID else None
+            return url if payload.get("app") == APP_ID and (legacy or payload.get("storage_id") == storage_id(directory)) else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
-    # Keep the nominal user path stable across packaged and normal Windows launches.
-    # resolve() can rewrite LocalAppData into an MSIX virtualization path.
-    directory = args.data_dir.absolute()
+    directory = (args.data_dir if args.data_dir is not None else default_data_dir()).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=directory / "paperdesk.log", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", encoding="utf-8")
     mutex = None
     if os.name == "nt":
-        import hashlib
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
         kernel.CreateMutexW.restype = ctypes.c_void_p
@@ -931,6 +1042,8 @@ def main():
     store = None
     server = None
     try:
+        if args.data_dir is None:
+            prepare_default_storage(directory)
         store = Store(directory)
         for port in range(args.port, args.port + 20):
             try:

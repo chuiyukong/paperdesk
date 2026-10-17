@@ -133,6 +133,8 @@ function backupLabel(name) {
   if(name.startsWith('daily-'))return '每日自动备份';
   if(name.startsWith('delete-'))return '删除前备份';
   if(name.startsWith('restore-'))return '恢复前备份';
+  if(name.startsWith('migration-'))return '迁移后完整备份';
+  if(name.startsWith('imported-'))return '保留的旧版备份';
   if(name.startsWith('upgrade-'))return '升级前备份';
   return '本机备份';
 }
@@ -140,7 +142,7 @@ function backupLabel(name) {
 function renderBackup() {
   $('content').innerHTML=header('数据与备份','记录自动保存在本机，备份可以手动带走。')+
     `<div class="backup-grid"><section class="panel backup-section"><h2>本机数据</h2><p>每次保存都会写入数据库。浏览器缓存清理后，论文记录仍然保留。</p><div class="path-block">${esc(state.database_path)}</div><button class="button secondary small" data-action="open-storage" data-kind="data">打开数据文件夹 ↗</button><div class="section-heading">导出与恢复</div><p>完整备份包含论文、期刊、所有投稿轮次、转投计划和文件路径。稿件正文保留在原位置。</p><div class="backup-actions"><button class="button primary" data-action="export">导出完整备份</button><button class="button secondary" data-action="import">从 JSON 备份恢复</button></div><p>换电脑后，可安装平台并恢复备份；原稿件路径需要重新关联。</p></section>
-    <section class="panel backup-section"><h2>本机自动备份</h2><p>每日首次修改前保留一份快照；删除或恢复数据前额外备份。保留最近 30 天，不自动上传云端。</p><div class="path-block">${esc(state.backup_dir)}</div><button class="button secondary small" data-action="open-storage" data-kind="backups">打开备份文件夹 ↗</button><div class="backup-list">${state.backups.length?state.backups.map(b=>`<div class="backup-row"><div title="${esc(b.name)}">${backupLabel(b.name)}<small>${esc(b.modified_at.slice(0,19).replace('T',' '))} · ${Math.ceil(b.size/1024)} KB</small></div><button class="link-button" data-action="restore-snapshot" data-name="${esc(b.name)}">恢复</button></div>`).join(''):'<p>首次保存论文或期刊后，会自动生成备份。</p>'}</div></section></div>`;
+    <section class="panel backup-section"><h2>本机自动备份</h2><p>每日首次修改前保留一份快照；删除或恢复数据前额外备份。保留最近 30 天，不自动上传云端。首次登记前的快照可能含 0 篇论文，请按记录数量选择。</p><div class="path-block">${esc(state.backup_dir)}</div><button class="button secondary small" data-action="open-storage" data-kind="backups">打开备份文件夹 ↗</button><div class="backup-list">${state.backups.length?state.backups.map(b=>`<div class="backup-row"><div title="${esc(b.name)}">${backupLabel(b.name)}<small>${b.counts?`${b.counts.papers} 篇论文 · ${b.counts.journals} 个期刊 · ${b.counts.submissions} 轮投稿`:'无法读取这份备份'}</small><small>${esc(b.modified_at.slice(0,19).replace('T',' '))} · ${Math.ceil(b.size/1024)} KB</small></div><button class="link-button" data-action="restore-snapshot" data-name="${esc(b.name)}" ${b.counts?'':'disabled'}>恢复</button></div>`).join(''):'<p>首次保存论文或期刊后，会自动生成备份。</p>'}</div></section></div>`;
 }
 
 function drawerHeader(title,subtitle='') {return `<div class="drawer-header"><div><div class="eyebrow">${esc(subtitle||'PAPERDESK')}</div><h2 id="drawer-title">${esc(title)}</h2></div><button class="close-button" data-action="close-drawer" aria-label="关闭侧栏">×</button></div>`;}
@@ -338,11 +340,16 @@ $('modal-ok').addEventListener('click',()=>resolveModal(true));
 
 async function restorePayload(payload) {
   if(payload?.app!=='paperdesk-local-v1'||![1,2,3].includes(payload.schema_version)||!payload.data)throw new Error('请选择本平台导出的完整 JSON 备份。');
-  const papers=payload.data.papers?.length??0,journals=payload.data.journals?.length??0,rounds=payload.data.submissions?.length??0;
-  if(!await confirmAction('用这份备份恢复数据？',`备份包含 ${papers} 篇论文、${journals} 个期刊、${rounds} 轮投稿。\n恢复会替换当前记录，当前数据会先自动备份；稿件文件不会改变。`,'恢复数据'))return;
-  await api('/api/restore','POST',payload);
+  const {counts}=await api('/api/restore/preview','POST',payload);
+  if(!await confirmRestore(counts))return;
+  const result=await api('/api/restore','POST',{...payload,allow_empty:counts.papers===0});
   filters={search:'',stage:'',journal:'',overdue:false,sort:'recent'};
-  await refresh();toast('备份已恢复');
+  await refresh();toast(`已恢复 ${result.counts.papers} 篇论文、${result.counts.submissions} 轮投稿`);
+}
+
+async function confirmRestore(counts,description='所选 JSON 备份') {
+  const empty=counts.papers===0&&state.papers.length>0;
+  return confirmAction(empty?'这份备份没有论文，仍要恢复？':'恢复这份备份？',`${description}\n已校验：${counts.papers} 篇论文、${counts.journals} 个期刊、${counts.submissions} 轮投稿、${counts.files} 个文件关联。\n${empty?`恢复后当前 ${state.papers.length} 篇论文将从列表中移除。\n`:''}恢复会替换当前记录，当前数据会先自动备份；稿件文件不会改变。`,empty?'确认恢复空备份':'恢复数据');
 }
 
 $('import-file').addEventListener('change',async e=>{
@@ -406,8 +413,9 @@ document.addEventListener('click',async event=>{
     else if(action==='restore-snapshot'){
       const selected=state.backups.find(b=>b.name===button.dataset.name);
       const description=selected?`${backupLabel(selected.name)} · ${selected.modified_at.slice(0,19).replace('T',' ')}`:'所选备份';
-      if(!await confirmAction('恢复这份本机自动备份？',`${description}\n这将替换当前记录，当前数据会先额外备份。`,'恢复数据'))return;
-      await api('/api/backups/restore','POST',{name:button.dataset.name});filters={search:'',stage:'',journal:'',overdue:false,sort:'recent'};await refresh();toast('自动备份已恢复');
+      const {counts}=await api('/api/backups/preview','POST',{name:button.dataset.name});
+      if(!await confirmRestore(counts,description))return;
+      const result=await api('/api/backups/restore','POST',{name:button.dataset.name,allow_empty:counts.papers===0});filters={search:'',stage:'',journal:'',overdue:false,sort:'recent'};await refresh();toast(`已恢复 ${result.counts.papers} 篇论文、${result.counts.submissions} 轮投稿`);
     }
     else if(action==='reload')location.reload();
   }catch(error){formError(error);}

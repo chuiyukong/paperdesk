@@ -12,7 +12,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from paperdesk import Store, ValidationError, make_server
+from paperdesk import Store, ValidationError, make_server, default_data_dir, legacy_data_dirs, prepare_default_storage, existing_url, storage_id
 
 
 class StoreTests(unittest.TestCase):
@@ -213,6 +213,30 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.store.restore_snapshot("../../paperdesk.sqlite3")
 
+    def test_restore_preview_counts_empty_guard_and_explicit_empty_restore(self):
+        before = self.store.export()
+        empty = next(b for b in self.store.backups() if b["counts"]["papers"] == 0)
+        payload = self.store.snapshot_payload(empty["name"])
+        self.assertEqual(self.store.preview_restore(payload), {"papers": 0, "journals": 0, "submissions": 0, "files": 0})
+        self.assertEqual(self.store.export()["data"], before["data"])
+        with self.assertRaisesRegex(ValidationError, "0 篇论文"):
+            self.store.restore_snapshot(empty["name"])
+        self.assertEqual(self.store.export()["data"], before["data"])
+        self.store.restore_snapshot(empty["name"], allow_empty=True)
+        self.assertEqual(self.store.state()["papers"], [])
+        safety = next(b for b in self.store.backups() if b["name"].startswith("restore-") and b["counts"]["papers"] == 1)
+        self.store.restore_snapshot(safety["name"])
+        self.assertEqual(self.store.export()["data"], before["data"])
+
+    def test_corrupt_snapshot_visible_but_preview_does_not_modify_records(self):
+        bad = self.store.backup_dir / "daily-2026-10-13.sqlite3"
+        bad.write_bytes(b"not a database")
+        before = self.store.export()["data"]
+        self.assertIsNone(next(b for b in self.store.backups() if b["name"] == bad.name)["counts"])
+        with self.assertRaises(ValidationError):
+            self.store.preview_restore(self.store.snapshot_payload(bad.name))
+        self.assertEqual(self.store.export()["data"], before)
+
     def test_backup_and_restore_write_failure_cannot_overwrite_records(self):
         before = self.store.export()
         with patch.object(self.store, "snapshot", side_effect=OSError("disk full")):
@@ -376,6 +400,105 @@ class StoreTests(unittest.TestCase):
             self.store.open_registered("file", file_id)
 
 
+class StorageMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="paperdesk-migration-")
+        self.root = Path(self.temp.name)
+        self.target = self.root / "stable"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def seed(self, name, title=None):
+        directory = self.root / name
+        with closing(Store(directory)) as store:
+            if title:
+                journal = store.journal_save({"name": "测试期刊", "guidelines_url": "https://example.com/authors"})
+                store.paper_save({"title": title, "authors": "测试作者", "stage": "submitted", "files": [{"path": str(directory / "稿件.docx")}], "initial_submission": {"journal_id": journal, "submitted_on": "2024-12-31"}})
+            return directory, store.export()["data"]
+
+    def test_default_path_independent_of_localappdata_and_discovery_of_redirected_store(self):
+        with patch("paperdesk.Path.home", return_value=self.root), patch.dict("os.environ", {"LOCALAPPDATA": str(self.root / "normal")}):
+            first = default_data_dir()
+        with patch("paperdesk.Path.home", return_value=self.root), patch.dict("os.environ", {"LOCALAPPDATA": str(self.root / "redirected")}):
+            self.assertEqual(default_data_dir(), first)
+            self.assertEqual(first, self.root / "PaperDesk")
+        normal, _ = self.seed("Local/PaperDesk")
+        redirected, _ = self.seed("Local/Packages/OpenAI.Codex_test/LocalCache/Local/PaperDesk", "旧记录")
+        with patch.dict("os.environ", {"LOCALAPPDATA": str(self.root / "Local")}):
+            self.assertEqual(set(legacy_data_dirs()), {normal.resolve(), redirected.resolve()})
+
+    def test_migrate_populated_store_and_backups_without_modifying_either_legacy_store(self):
+        empty, _ = self.seed("normal")
+        source, expected = self.seed("redirected", "原记录")
+        before = (source / "paperdesk.sqlite3").read_bytes()
+        prepare_default_storage(self.target, [empty, source])
+        with closing(Store(self.target)) as store:
+            self.assertEqual(store.export()["data"], expected)
+            migrated = next(b for b in store.backups() if b["name"].startswith("migration-"))
+            self.assertEqual(migrated["counts"], {"papers": 1, "journals": 1, "submissions": 1, "files": 1})
+            store.restore_snapshot(migrated["name"])
+            self.assertEqual(store.export()["data"], expected)
+        self.assertEqual((source / "paperdesk.sqlite3").read_bytes(), before)
+        with closing(Store(empty)) as store:
+            self.assertEqual(store.state()["papers"], [])
+
+    def test_conflicting_stores_are_preserved_without_choosing_one(self):
+        first, _ = self.seed("first", "记录一")
+        second, _ = self.seed("second", "记录二")
+        before = [(p / "paperdesk.sqlite3").read_bytes() for p in (first, second)]
+        with self.assertRaisesRegex(ValidationError, "多份内容不同"):
+            prepare_default_storage(self.target, [first, second])
+        self.assertFalse((self.target / "paperdesk.sqlite3").exists())
+        self.assertEqual([(p / "paperdesk.sqlite3").read_bytes() for p in (first, second)], before)
+
+    def test_equivalent_old_and_upgraded_databases_migrate_as_one_dataset(self):
+        fixture = Path(__file__).parent / "testdata"
+        old = self.root / "v1"
+        old.mkdir()
+        with closing(sqlite3.connect(old / "paperdesk.sqlite3")) as connection:
+            connection.executescript((fixture / "v1-schema.sql").read_text(encoding="utf-8"))
+            data = json.loads((fixture / "v1-backup.json").read_text(encoding="utf-8"))["data"]
+            with connection:
+                Store.insert_export(connection, data)
+        old_bytes = (old / "paperdesk.sqlite3").read_bytes()
+        newer = self.root / "upgraded"
+        newer.mkdir()
+        (newer / "paperdesk.sqlite3").write_bytes(old_bytes)
+        with closing(Store(newer)) as store:
+            expected = store.export()["data"]
+        prepare_default_storage(self.target, [old, newer])
+        with closing(Store(self.target)) as store:
+            self.assertEqual(store.export()["data"], expected)
+        self.assertEqual((old / "paperdesk.sqlite3").read_bytes(), old_bytes)
+
+    def test_existing_store_never_replaced_or_resurrected_from_old_data(self):
+        old, _ = self.seed("legacy", "旧记录")
+        self.target, _ = self.seed("stable")
+        prepare_default_storage(self.target, [old])
+        with closing(Store(self.target)) as store:
+            self.assertEqual(store.state()["papers"], [])
+
+    def test_migration_write_failure_preserves_sources_and_does_not_publish_partial_store(self):
+        source, _ = self.seed("legacy", "旧记录")
+        before = (source / "paperdesk.sqlite3").read_bytes()
+        with patch("paperdesk.shutil.copy2", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            prepare_default_storage(self.target, [source])
+        self.assertFalse((self.target / "paperdesk.sqlite3").exists())
+        self.assertEqual((source / "paperdesk.sqlite3").read_bytes(), before)
+        prepare_default_storage(self.target, [source])
+        with closing(Store(self.target)) as store:
+            self.assertEqual(len(store.state()["papers"]), 1)
+
+    def test_corrupt_legacy_database_cannot_silently_start_an_empty_store(self):
+        source = self.root / "broken"
+        source.mkdir()
+        (source / "paperdesk.sqlite3").write_bytes(b"broken database")
+        with self.assertRaises(ValidationError):
+            prepare_default_storage(self.target, [source])
+        self.assertFalse((self.target / "paperdesk.sqlite3").exists())
+
+
 class APITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="paperdesk-api-")
@@ -448,6 +571,38 @@ class APITests(unittest.TestCase):
     def test_port_is_exclusive(self):
         with self.assertRaises(OSError):
             make_server(self.store, self.server.server_port)
+
+    def test_instance_reuse_requires_matching_database_identity(self):
+        (self.store.directory / "instance.json").write_text(json.dumps({"port": self.server.server_port}), encoding="utf-8")
+        self.assertEqual(existing_url(self.store.directory), self.url)
+        other = self.store.directory / "other"
+        other.mkdir()
+        (other / "instance.json").write_text(json.dumps({"port": self.server.server_port}), encoding="utf-8")
+        self.assertIsNone(existing_url(other))
+        self.assertNotEqual(storage_id(other), storage_id(self.store.directory))
+        with self.assertRaisesRegex(ValidationError, "旧版平台仍在运行"):
+            prepare_default_storage(other / "new", [self.store.directory])
+
+    def test_restore_api_validates_preview_reports_counts_and_protects_against_empty_restore(self):
+        self.store.paper_save({"title": "保留论文", "stage": "writing"})
+        before = self.store.export()
+        headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url}
+        empty = self.store.backups()[0]["name"]
+        code, body, _ = self.request("/api/backups/preview", "POST", {"name": empty}, headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["counts"]["papers"], 0)
+        self.assertEqual(self.store.export()["data"], before["data"])
+        self.assertEqual(self.request("/api/backups/restore", "POST", {"name": empty}, headers)[0], 400)
+        code, body, _ = self.request("/api/restore/preview", "POST", before, headers)
+        self.assertEqual(json.loads(body)["counts"]["papers"], 1)
+        self.assertEqual(self.request("/api/restore/preview", "POST", {"broken": True}, headers)[0], 400)
+        code, body, _ = self.request("/api/backups/restore", "POST", {"name": empty, "allow_empty": True}, headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["counts"]["papers"], 0)
+        code, body, _ = self.request("/api/restore", "POST", before, headers)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["counts"]["papers"], 1)
+        self.assertEqual(self.store.export()["data"], before["data"])
 
 
 if __name__ == "__main__":
