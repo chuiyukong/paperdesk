@@ -70,6 +70,18 @@ checked('empty filtered list explains records remain saved',()=>{
   assert(html.includes('清除筛选'));
 });
 
+
+for(const count of [0,1,3,4,5,8]){
+  checked(`backup folding boundary: ${count} snapshots`,()=>{
+    const backups=Array.from({length:count},(_,i)=>({name:`paper-added-2026-10-20-${i}.sqlite3`,counts:{papers:i+1,journals:1,submissions:0},modified_at:'2026-10-20T12:00:00',size:64000}));
+    const context={esc:v=>String(v)};vm.createContext(context);
+    const html=vm.runInContext(chunk('function backupLabel(','async function renderBackup(')+`\nbackupList(${JSON.stringify(backups)})`,context);
+    assert.equal((html.match(/class="backup-row"/g)||[]).length,count);
+    if(count<=4)assert(!html.includes('toggle-backups'));
+    else {assert(html.includes('aria-expanded="false"'));assert(html.includes(`更多备份（${count-3} 份）`));const before=html.split('<div id="older-backups" hidden>')[0];assert.equal((before.match(/class="backup-row"/g)||[]).length,3);}
+  });
+}
+
 async function testSaves(){
   const values={'p-code':'0001','p-title':'保存测试','p-authors':'作者','p-tags':'','p-stage':'writing','p-notes':'备注','p-folder':'','p-target-journal':'','p-planned-on':'','p-writing-on':'2026-10-17'};
   const nodes=Object.fromEntries(Object.entries(values).map(([id,value])=>[id,{value}]));
@@ -140,4 +152,19 @@ async function testTransferForm(closed){
   output.push(`${closed?'already ended':'active'} transfer form selects the first candidate and retains remaining order`);
 }
 
-(async()=>{await testSaves();await testReceipt();await testVersions();await testTransferForm(false);await testTransferForm(true);console.log(`${output.length} frontend checks passed`);for(const name of output)console.log(`  PASS ${name}`);})().catch(error=>{console.error(error);process.exitCode=1;});
+async function testPickerLifecycle(mode){
+  let resolvePick;const waitPick=new Promise(resolve=>{resolvePick=resolve;});const added=[];
+  const button={textContent:'选择文件并关联',disabled:false,isConnected:true};
+  const context={button,drawerGeneration:4,drawerDirty:false,toast(){},api:()=>waitPick,fileEditRow:entry=>JSON.stringify(entry),$:()=>({insertAdjacentHTML(_position,html){added.push(JSON.parse(html));}})};
+  vm.createContext(context);vm.runInContext(chunk('async function selectLocalPath(','function fileEditRow('),context);
+  const pending=vm.runInContext("selectLocalPath(button,'choose-and-add-file')",context);
+  assert(button.disabled);
+  if(mode==='switched')context.drawerGeneration=5;
+  resolvePick(mode==='cancel'?{}:{path:'C:/papers/final.txt'});await pending;
+  if(mode==='selected'){assert.equal(added.length,1);assert.equal(added[0].label,'final.txt');assert.equal(added[0].path,'C:/papers/final.txt');assert(context.drawerDirty);}
+  else{assert.equal(added.length,0);assert.equal(context.drawerDirty,false);}
+  assert.equal(button.disabled,false);assert.equal(button.textContent,'选择文件并关联');
+  output.push(`file picker lifecycle: ${mode}`);
+}
+
+(async()=>{await testPickerLifecycle('selected');await testPickerLifecycle('cancel');await testPickerLifecycle('switched');await testSaves();await testReceipt();await testVersions();await testTransferForm(false);await testTransferForm(true);console.log(`${output.length} frontend checks passed`);for(const name of output)console.log(`  PASS ${name}`);})().catch(error=>{console.error(error);process.exitCode=1;});

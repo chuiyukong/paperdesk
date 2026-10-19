@@ -1,5 +1,5 @@
 /* Shared interaction rules, separate from the page layout. */
 body.drawer-open{overflow:hidden}
-details>summary{font-size:16px;color:#3f639c;cursor:pointer;font-weight:600}
+details>summary{font-size:16px;color:var(--blue);cursor:pointer;font-weight:600}
 details[open]>summary{margin-bottom:16px}
 details .form-field{margin-bottom:13px}

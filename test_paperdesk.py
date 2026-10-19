@@ -16,6 +16,19 @@ from urllib.request import Request, urlopen
 from paperdesk import Store, ValidationError, make_server, SCHEMA_VERSION, APP_VERSION, ConflictError, InvalidDatabase, UnsupportedSchema, recover_database, default_data_dir, legacy_data_dirs, prepare_default_storage, existing_url, storage_id
 
 
+def empty_snapshot(store):
+    with tempfile.TemporaryDirectory(prefix="paperdesk-empty-") as directory:
+        empty = Store(Path(directory))
+        try:
+            empty.snapshot("manual")
+            source = next(empty.backup_dir.glob("manual-*.sqlite3"))
+            target = store.backup_dir / f"manual-empty-{store.day_provider().isoformat()}.sqlite3"
+            target.write_bytes(source.read_bytes())
+            return target.name
+        finally:
+            empty.close()
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="paperdesk-test-")
@@ -197,36 +210,41 @@ class StoreTests(unittest.TestCase):
                 self.store.restore(corrupt)
             self.assertEqual(self.store.export()["data"], before)
 
-    def test_automatic_snapshot_integrity_retention_and_restore(self):
+    def test_new_paper_snapshot_integrity_retention_and_restore(self):
         backups = self.store.backups()
-        self.assertEqual(len(backups), 2)
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0]["name"].startswith("paper-added-"))
         with closing(sqlite3.connect(self.store.backup_dir / backups[0]["name"])) as saved:
             self.assertEqual(saved.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(saved.execute("SELECT COUNT(*) FROM papers").fetchone()[0], 1)
         exported = self.store.export()
-        self.store.snapshot("restore")
-        snapshot = next(b["name"] for b in self.store.backups() if b["name"].startswith("restore-"))
         self.store.paper_delete(self.paper)
-        self.store.restore_snapshot(snapshot)
+        self.store.restore_snapshot(backups[0]["name"])
         self.assertEqual(self.store.export()["data"], exported["data"])
+        self.assertEqual(len(self.store.backups()), 1)
         self.day += dt.timedelta(days=31)
         self.store.journal_save({"name": "新的一天"})
-        self.assertEqual(len(self.store.backups()), 2)
+        self.assertEqual(len(self.store.backups()), 1)
+        self.store.paper_save({"title": "超过保留期限后新建", "stage": "writing"})
+        self.assertEqual(len(self.store.backups()), 1)
+        self.assertEqual(self.store.backups()[0]["counts"]["papers"], 2)
         with self.assertRaises(ValidationError):
             self.store.restore_snapshot("../../paperdesk.sqlite3")
 
-    def test_restore_preview_counts_empty_guard_and_explicit_empty_restore(self):
+    def test_restore_preview_counts_empty_guard_without_automatic_safety_backup(self):
         before = self.store.export()
-        empty = next(b for b in self.store.backups() if b["counts"]["papers"] == 0)
-        payload = self.store.snapshot_payload(empty["name"])
-        self.assertEqual(self.store.preview_restore(payload), {"papers": 0, "journals": 0, "submissions": 0, "files": 0})
+        empty = empty_snapshot(self.store)
+        nonempty = next(b["name"] for b in self.store.backups() if b["counts"]["papers"] == 1)
+        names = {b["name"] for b in self.store.backups()}
+        self.assertEqual(self.store.preview_restore(self.store.snapshot_payload(empty)), {"papers": 0, "journals": 0, "submissions": 0, "files": 0})
         self.assertEqual(self.store.export()["data"], before["data"])
         with self.assertRaisesRegex(ValidationError, "0 篇论文"):
-            self.store.restore_snapshot(empty["name"])
+            self.store.restore_snapshot(empty)
         self.assertEqual(self.store.export()["data"], before["data"])
-        self.store.restore_snapshot(empty["name"], allow_empty=True)
+        self.store.restore_snapshot(empty, allow_empty=True)
         self.assertEqual(self.store.state()["papers"], [])
-        safety = next(b for b in self.store.backups() if b["name"].startswith("restore-") and b["counts"]["papers"] == 1)
-        self.store.restore_snapshot(safety["name"])
+        self.assertEqual({b["name"] for b in self.store.backups()}, names)
+        self.store.restore_snapshot(nonempty)
         self.assertEqual(self.store.export()["data"], before["data"])
 
     def test_corrupt_snapshot_visible_but_preview_does_not_modify_records(self):
@@ -240,9 +258,11 @@ class StoreTests(unittest.TestCase):
 
     def test_backup_and_restore_write_failure_cannot_overwrite_records(self):
         before = self.store.export()
-        with patch.object(self.store, "snapshot", side_effect=OSError("disk full")):
-            with self.assertRaises(OSError):
-                self.store.paper_delete(self.paper)
+        with patch.object(self.store, "snapshot", side_effect=OSError("disk full")) as snapshot:
+            self.store.paper_delete(self.paper)
+            snapshot.assert_not_called()
+        self.assertEqual(self.store.export()["data"]["papers"], [])
+        self.store.restore(before)
         self.assertEqual(self.store.export()["data"], before["data"])
 
         original = Store.insert_export
@@ -488,25 +508,25 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(previous["ended_on"], "2026-10-10")
         self.assertEqual(previous["result"], "rejected")
 
-    def test_corrupt_daily_is_preserved_and_replaced_latest_contains_new_record(self):
-        daily = self.store.backup_dir / f"daily-{self.day.isoformat()}.sqlite3"
-        daily.write_bytes(b"broken")
+    def test_old_damaged_backup_is_preserved_and_new_paper_snapshot_is_complete(self):
+        old = self.store.backup_dir / f"daily-{self.day.isoformat()}.sqlite3"
+        old.write_bytes(b"broken")
         self.store.paper_save({"title": "新记录", "stage": "writing"})
-        self.assertTrue(any(p.read_bytes() == b"broken" for p in self.store.backup_dir.glob("damaged-*.sqlite3")))
-        latest = next(b for b in self.store.backups() if b["name"].startswith("latest-"))
-        self.assertEqual(latest["counts"]["papers"], 2)
-        self.assertIsNotNone(next(b for b in self.store.backups() if b["name"] == daily.name)["counts"])
+        self.assertEqual(old.read_bytes(), b"broken")
+        self.assertIsNone(next(b for b in self.store.backups() if b["name"] == old.name)["counts"])
+        newest = next(b for b in self.store.backups() if b["name"].startswith("paper-added-"))
+        self.assertEqual(newest["counts"]["papers"], 2)
 
-    def test_latest_backup_failure_acknowledges_committed_save(self):
+    def test_new_paper_backup_failure_acknowledges_committed_save(self):
         original = self.store.snapshot
         def fail_latest(reason="daily"):
-            if reason == "latest":
+            if reason == "paper-added":
                 raise OSError("simulated disk full")
             return original(reason)
         with patch.object(self.store, "snapshot", side_effect=fail_latest), self.assertLogs(level="ERROR"):
             ident = self.store.paper_save({"title": "记录保存了", "stage": "writing"})
         self.assertEqual(self.store.require("papers", ident)["title"], "记录保存了")
-        self.assertIn("记录已保存", self.store.backup_warning)
+        self.assertIn("论文已保存", self.store.backup_warning)
         self.store.paper_save({"title": "下一次成功", "stage": "writing"})
         self.assertIsNone(self.store.backup_warning)
 
@@ -538,6 +558,57 @@ class StoreTests(unittest.TestCase):
             self.store.submission_delete(ident, guard)
         self.assertEqual(self.store.require("papers", self.paper)["stage"], "revision")
         self.assertIsNone(self.store.require("submissions", ident)["ended_on"])
+
+    def test_regular_mutations_restore_and_reopen_do_not_create_backups(self):
+        names = {b["name"] for b in self.store.backups()}
+        self.store.journal_save({"name": "普通期刊更新", "url": ""}, self.journal)
+        paper = self.store.require("papers", self.paper)
+        self.store.paper_save({**paper, "notes": "普通编辑"}, self.paper)
+        ident = self.store.submission_save(self.paper, self.submission())
+        self.store.submission_save(self.paper, self.submission(progress="外审中"), ident)
+        self.store.submission_delete(ident)
+        before = self.store.export()
+        self.store.restore(before)
+        self.assertEqual({b["name"] for b in self.store.backups()}, names)
+        self.store.close()
+        saved_mtime = (Path(self.temp.name) / "paperdesk.sqlite3").stat().st_mtime_ns
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.path.stat().st_mtime_ns, saved_mtime)
+        self.assertEqual({b["name"] for b in self.store.backups()}, names)
+
+    def test_app_version_upgrade_creates_one_snapshot_without_schema_change(self):
+        before = self.store.export()["data"]
+        original_names = {b["name"] for b in self.store.backups()}
+        self.store.close()
+        with patch("paperdesk.APP_VERSION", "1.4.1"):
+            self.store = Store(Path(self.temp.name), lambda: self.day)
+            added = [b for b in self.store.backups() if b["name"] not in original_names]
+            self.assertEqual(len(added), 1)
+            self.assertTrue(added[0]["name"].startswith("upgrade-"))
+            self.assertEqual(self.store.export()["data"], before)
+            self.store.close()
+            self.store = Store(Path(self.temp.name), lambda: self.day)
+            self.assertEqual(len(self.store.backups()), len(original_names) + 1)
+
+    def test_upgrade_backup_failure_stops_opening_without_marking_upgrade(self):
+        before = self.store.export()["data"]
+        marker = self.store.directory / "installed-version.json"
+        saved_marker = marker.read_bytes()
+        self.store.close()
+        with patch("paperdesk.APP_VERSION", "1.4.1"), patch.object(Store, "snapshot", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(marker.read_bytes(), saved_marker)
+        self.store = Store(Path(self.temp.name), lambda: self.day)
+        self.assertEqual(self.store.export()["data"], before)
+
+    def test_new_paper_request_receipt_replay_does_not_duplicate_backups(self):
+        initial_count = len(self.store.backups())
+        data = {"title": "一次保存", "stage": "writing"}
+        create = lambda: {"id": self.store.paper_save(data)}
+        first = self.store.once("new-paper-backup-operation", "POST:/api/papers", data, create)
+        self.assertEqual(self.store.once("new-paper-backup-operation", "POST:/api/papers", data, create), first)
+        self.assertEqual(len(self.store.backups()), initial_count + 1)
 
     def test_once_receipt_is_atomic_and_survives_reopen(self):
         key = "operation-create-001"
@@ -801,7 +872,7 @@ class APITests(unittest.TestCase):
         self.store.paper_save({"title": "保留论文", "stage": "writing"})
         before = self.store.export()
         headers = {"Content-Type": "application/json", "X-PaperDesk-Token": self.server.token, "Origin": self.url}
-        empty = next(b["name"] for b in self.store.backups() if b["counts"] and b["counts"]["papers"] == 0)
+        empty = empty_snapshot(self.store)
         code, body, _ = self.request("/api/backups/preview", "POST", {"name": empty}, headers)
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["counts"]["papers"], 0)

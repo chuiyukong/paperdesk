@@ -13,3 +13,5 @@ migration-report.json
 .env
 .env.*
 论文管理台-完整备份-*.json
+
+installed-version.json

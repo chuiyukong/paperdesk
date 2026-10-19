@@ -287,11 +287,18 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        version_file = self.directory / "installed-version.json"
+        try:
+            installed = json.loads(version_file.read_text(encoding="utf-8"))
+            previous_version = installed.get("version") if isinstance(installed, dict) and installed.get("app") == APP_ID else None
+        except (OSError, ValueError):
+            previous_version = None
         try:
             if version not in (0, *SUPPORTED_SCHEMAS):
                 raise ValidationError("数据库版本不兼容，请保留文件并使用对应版本的平台。")
-            if version in (1, 2, 3):
+            if version and (version in (1, 2, 3) or previous_version != APP_VERSION):
                 self.snapshot("upgrade")
+            if version in (1, 2, 3):
                 migration = ["BEGIN IMMEDIATE;"]
                 if version == 1:
                     migration.extend(("ALTER TABLE papers ADD COLUMN planned_on TEXT;",
@@ -305,13 +312,15 @@ class Store:
                     migration.append(f"UPDATE papers SET paper_code='{index:04d}' WHERE id={int(row[0])};")
                 migration.extend(("PRAGMA user_version = 4;", "COMMIT;"))
                 self.conn.executescript("\n".join(migration))
-            self.conn.executescript(SCHEMA)
-            if version:
+            schema = SCHEMA if version == 0 else SCHEMA.replace(f"PRAGMA user_version = {SCHEMA_VERSION};", "")
+            self.conn.executescript(schema)
+            if previous_version != APP_VERSION:
+                temporary = version_file.with_suffix(".tmp")
                 try:
-                    self.snapshot("latest")
-                except (OSError, sqlite3.Error, ValidationError):
-                    logging.exception("Database opened; latest backup failed")
-                    self.backup_warning = "记录可读取，但最新完整备份未更新。请在数据与备份中重试。"
+                    temporary.write_text(json.dumps({"app": APP_ID, "version": APP_VERSION}), encoding="utf-8")
+                    temporary.replace(version_file)
+                finally:
+                    temporary.unlink(missing_ok=True)
         except Exception:
             self.conn.rollback()
             self.conn.close()
@@ -356,8 +365,11 @@ class Store:
         cutoff = self.day_provider() - dt.timedelta(days=29)
         for item in self.backup_dir.glob("*.sqlite3"):
             try:
-                saved_day = dt.date.fromisoformat(item.name.split("-", 1)[1][:10])
-            except (ValueError, IndexError):
+                match = re.search(r"-(\d{4}-\d{2}-\d{2})(?:-|\.)", item.name)
+                if not match:
+                    continue
+                saved_day = dt.date.fromisoformat(match[1])
+            except ValueError:
                 continue
             if saved_day < cutoff:
                 item.unlink()
@@ -366,7 +378,7 @@ class Store:
         with self.lock:
             if self._in_mutation:
                 return action()
-            self.snapshot(reason)
+            before_papers = self.conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
             try:
                 with self.conn:
                     self._in_mutation = True
@@ -375,12 +387,13 @@ class Store:
                 raise ValidationError("记录发生冲突：请检查期刊是否重名，或这篇论文是否已有进行中的投稿。") from None
             finally:
                 self._in_mutation = False
-            try:
-                self.snapshot("latest")
-                self.backup_warning = None
-            except (OSError, sqlite3.Error, ValidationError):
-                logging.exception("Records committed; latest backup failed")
-                self.backup_warning = "记录已保存，最新备份未更新。请在数据与备份中重试备份。"
+            if reason == "daily" and self.conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0] > before_papers:
+                try:
+                    self.snapshot("paper-added")
+                    self.backup_warning = None
+                except (OSError, sqlite3.Error, ValidationError):
+                    logging.exception("Paper committed; new-paper backup failed")
+                    self.backup_warning = "论文已保存，新增论文后的备份未完成。可在数据与备份中手动生成完整备份。"
             return result
 
     def check_revision(self, previous, data, key="expected_updated_at"):
@@ -897,7 +910,7 @@ class Store:
     def diagnostics(self, backups=None):
         with self.lock:
             backups = self.backups() if backups is None else backups
-            latest = next((b for b in backups if b["counts"] and b["name"].startswith("latest-")), None)
+            latest = next((b for b in backups if b["counts"]), None)
             return {"database_path": str(self.path), "counts": record_counts(self.export()["data"]),
                     "integrity_ok": self.conn.execute("PRAGMA quick_check").fetchone()[0] == "ok" and self.conn.execute("PRAGMA foreign_key_check").fetchone() is None,
                     "latest_backup": latest, "backup_warning": self.backup_warning,
@@ -1107,7 +1120,7 @@ class Handler(BaseHTTPRequestHandler):
             result = store.transfer_submission(int(parts[2]), data)
         elif parts == ["api", "backups", "refresh"] and self.command == "POST":
             with store.lock:
-                store.snapshot("latest")
+                store.snapshot("manual")
                 store.backup_warning = None
         elif parts == ["api", "restore"] and self.command == "POST":
             result["counts"] = store.restore(data, allow_empty=data.get("allow_empty", False))
@@ -1243,7 +1256,6 @@ def recover_database(directory, source, confirm):
         if not confirm(counts):
             return None
         staged.restore(payload, allow_empty=True)
-        staged.snapshot("recovery")
     finally:
         staged.close()
     original = directory / "paperdesk.sqlite3"
@@ -1255,17 +1267,8 @@ def recover_database(directory, source, confirm):
         shutil.copy2(path, saved_backups / path.name)
     backups = directory / "backups"
     backups.mkdir(exist_ok=True)
-    for path in staged.backup_dir.glob("recovery-*.sqlite3"):
-        shutil.copy2(path, backups / path.name)
     staged.path.replace(original)
-    restored = Store(directory)
-    try:
-        try:
-            restored.snapshot("latest")
-        except (OSError, sqlite3.Error, ValidationError):
-            logging.exception("Recovery completed; latest backup refresh failed; recovery snapshot retained")
-    finally:
-        restored.close()
+    Store(directory).close()
     return counts
 
 
