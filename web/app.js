@@ -1,5 +1,5 @@
 'use strict';
-const BUILD_VERSION='1.4.1';
+const BUILD_VERSION='1.4.2';
 
 const stages = {planned:'计划中',writing:'正在写',submitted:'已投稿',revision:'退修中',accepted:'已录用/发表',archived:'归档'};
 const results = {accepted:'录用',rejected:'退稿',withdrawn:'撤稿',other:'其他结束'};

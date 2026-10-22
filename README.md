@@ -2,7 +2,7 @@
 
 一个在 Windows 本机运行的论文投稿管理工具。浏览器提供界面，Python 和 SQLite 自动保存记录，无需购买服务器或安装第三方依赖。
 
-![蓝灰钴蓝界面预览](界面预览.png)
+![海军蓝界面预览](界面预览.png)
 
 ## 开始使用
 
@@ -64,6 +64,8 @@ v1.4.0 调整为仅新增论文成功后与升级前自动备份，普通编辑�
 - [v1.4.0](https://github.com/chuiyukong/paperdesk/releases/tag/v1.4.0)：Linear 视觉参考、分组表单与本地关联优化、新增/升级自动备份、历史备份折叠。
 
 - [v1.4.1](https://github.com/chuiyukong/paperdesk/releases/tag/v1.4.1)：确认后的蓝灰侧边栏，以及使用平台 Logo 的桌面启动快捷方式。
+
+- [v1.4.2](https://github.com/chuiyukong/paperdesk/releases/tag/v1.4.2)：侧边栏恢复海军蓝配色，沿用当前布局和桌面启动入口。
 
 当前版本写在 `VERSION` 文件中，并显示在平台页脚。
 
