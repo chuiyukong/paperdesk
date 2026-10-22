@@ -580,7 +580,7 @@ class StoreTests(unittest.TestCase):
         before = self.store.export()["data"]
         original_names = {b["name"] for b in self.store.backups()}
         self.store.close()
-        with patch("paperdesk.APP_VERSION", "1.4.1"):
+        with patch("paperdesk.APP_VERSION", APP_VERSION + "-upgrade-test"):
             self.store = Store(Path(self.temp.name), lambda: self.day)
             added = [b for b in self.store.backups() if b["name"] not in original_names]
             self.assertEqual(len(added), 1)
@@ -595,7 +595,7 @@ class StoreTests(unittest.TestCase):
         marker = self.store.directory / "installed-version.json"
         saved_marker = marker.read_bytes()
         self.store.close()
-        with patch("paperdesk.APP_VERSION", "1.4.1"), patch.object(Store, "snapshot", side_effect=OSError("disk full")):
+        with patch("paperdesk.APP_VERSION", APP_VERSION + "-upgrade-test"), patch.object(Store, "snapshot", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 Store(Path(self.temp.name), lambda: self.day)
         self.assertEqual(marker.read_bytes(), saved_marker)

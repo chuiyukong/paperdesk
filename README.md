@@ -2,13 +2,15 @@
 
 一个在 Windows 本机运行的论文投稿管理工具。浏览器提供界面，Python 和 SQLite 自动保存记录，无需购买服务器或安装第三方依赖。
 
-![石墨钴蓝界面预览](界面预览.png)
+![蓝灰钴蓝界面预览](界面预览.png)
 
 ## 开始使用
 
 1. 安装 **Python 3.12**，保留 Python Launcher 和 Tk 组件。
 2. 下载 [最新版本](https://github.com/chuiyukong/paperdesk/releases/latest) 的 ZIP，解压到一个固定文件夹。
 3. 双击 **启动论文管理平台.cmd**，浏览器自动打开平台。
+
+可运行 **create_desktop_shortcut.py** 创建带平台 Logo 的“论文管理台”桌面快捷方式；使用 Python 无窗口启动，重复启动复用已有服务。移动程序目录后重新创建即可。
 
 默认优先使用 `http://127.0.0.1:8766/`。端口被占用时自动选择后续可用端口；重复启动复用已有服务。访问网址只会打开页面，启动程序需要双击入口。
 
@@ -60,6 +62,8 @@ v1.4.0 调整为仅新增论文成功后与升级前自动备份，普通编辑�
 - [v1.3.0](https://github.com/chuiyukong/paperdesk/releases/tag/v1.3.0)：唯一稿件编号、实际转投与轮次留存、阶段表格改进、保存去重与冲突保护、保存后完整备份和启动恢复。
 
 - [v1.4.0](https://github.com/chuiyukong/paperdesk/releases/tag/v1.4.0)：Linear 视觉参考、分组表单与本地关联优化、新增/升级自动备份、历史备份折叠。
+
+- [v1.4.1](https://github.com/chuiyukong/paperdesk/releases/tag/v1.4.1)：确认后的蓝灰侧边栏，以及使用平台 Logo 的桌面启动快捷方式。
 
 当前版本写在 `VERSION` 文件中，并显示在平台页脚。
 
